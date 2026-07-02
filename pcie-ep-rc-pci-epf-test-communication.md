@@ -157,14 +157,25 @@ dmesg | tail
 
 参考预期：Gen4 x4 理论线速 ~7.88 GB/s；DMA 大块（≥1MB）通常能到数 GB/s；CPU memcpy 路径只有几十~几百 MB/s，慢是正常的，不代表链路有问题。如果 `-d` 报 NOT OKAY 或速率和非 DMA 一样低，检查 A 板内核是否使能了 EP 的 DMA 引擎驱动（DWC 控制器对应 `CONFIG_DW_EDMA`），以及 `pci_epf_test` probe 时 dmesg 有没有 "Failed to get DMA channel" 之类的提示。
 
-## 5. 常见问题
+## 5. 结果怎么解读
+
+一次真实调试(BST A2000 双板)的首轮结果和结论,可作对照:
+
+| 结果 | 解读 |
+| --- | --- |
+| `pcitest -w -s 1048576` OKAY | **B→A 主链路已闭环**:命令写入 BAR0 → EP 读 RC 内存 1MB → CRC 通过 → MSI-X 回中断。这一条过了,核心通信就是通的 |
+| `pcitest -b 0` NOT OKAY | BAR0 是协议寄存器区,不同内核版本对它的 BAR 测试行为不一;`-w` 能过说明寄存器区实际可读写,不当阻塞项。注意 `-b 0 && -b 1` 会短路,BAR1 要单独跑 |
+| `-m 32` / `-x 256` NOT OKAY | 不是中断不通(`-w` 的完成通知就是中断),是**高号向量**不通,通常是 RC 实际分配的向量数少于 EP 声明值。用 `for i in 1 2 4 8 ...; do pcitest -x $i; done` 扫出边界,配合 `/proc/interrupts` 和 `lspci -vv` 的 MSI-X Count 确认。够用即可 |
+| 所有 `-d` NOT OKAY | EP 侧多半没拿到 DMA 通道。查 A 板 dmesg(probe 时 "Failed to get DMA" 类打印、跑 `-d` 时的报错),确认 eDMA 驱动使能。对照:`-w -s 4194304`(不带 `-d` 的大块)排除 buffer 分配问题,`-d -w -s 65536`(小块 DMA)确认是 DMA 本身 |
+
+## 6. 常见问题
 
 - **`/dev/pci-endpoint-test.0` 不出现**：`new_id` 没写、或写在 rescan 之前设备还不存在。绑定后 `lspci -k -s 01:00.0` 应显示 `Kernel driver in use: pci-endpoint-test`。
 - **中断测试 NOT OKAY**：优先查 RC 侧 MSI 分配（`cat /proc/interrupts | grep endpoint`）；ARM 平台确认 GIC ITS 可用；INTx 不通但 MSI 通在 EP 控制器上很常见（很多 EP 控制器不支持发 INTx），不阻塞后续。
 - **A 板重启/重新 start EP 后测试挂死**：RC 侧残留的是旧设备状态。先 `echo 1 > /sys/bus/pci/devices/0000:01:00.0/remove`，A 板重新初始化 EP 后 B 板再 rescan + retrain + 重新绑定。
 - **每次都要 retrain 才到 Gen4**：现阶段可以先用 setpci 顶着，之后查 EP 侧控制器的 target link speed 配置（DT 里 `max-link-speed`）和均衡参数，让它训练时直接上 Gen4。
 
-## 6. 通了之后：面向 EP2 推理的下一步
+## 7. 通了之后：面向 EP2 推理的下一步
 
 `pci_epf_test` 只是链路验证工具，跑通它说明**枚举、BAR、MSI/MSI-X、EP 主动 DMA、双向数据完整性**全部就绪。推理数据面有两条路：
 

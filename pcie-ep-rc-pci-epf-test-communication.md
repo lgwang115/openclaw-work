@@ -67,9 +67,17 @@ ls /dev/pci-endpoint-test.0
 
 注意：一旦驱动绑定，**不要再用 devmem 裸写 BAR0**——BAR0 是测试协议的寄存器区（magic/command/status/地址寄存器），裸写会干扰测试。
 
-## 3. 编译 pcitest
+## 3. 获取 pcitest
 
-`pcitest` 在内核源码树里，要用**和板子内核版本对应**的源码编译：
+先看板子 BSP 是不是已经预装了（比如黑芝麻 A2000 的 SDK 自带 `/usr/bst/bin/pcitest`）：
+
+```bash
+which pcitest && pcitest -h
+```
+
+预装的二进制和板上内核配套，直接用即可；用 `-h` 确认支持 `-d`（DMA）选项（内核 5.7 之后才有）。BSP 里通常也带 `pcitest.sh` 全量脚本。
+
+没有预装时，从**和板子内核版本对应**的源码树编译：
 
 ```bash
 # 内核 <= 6.12：工具在 tools/pci/

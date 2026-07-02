@@ -164,7 +164,7 @@ dmesg | tail
 | 结果 | 解读 |
 | --- | --- |
 | `pcitest -w -s 1048576` OKAY | **B→A 主链路已闭环**:命令写入 BAR0 → EP 读 RC 内存 1MB → CRC 通过 → MSI-X 回中断。这一条过了,核心通信就是通的 |
-| `pcitest -b 0` NOT OKAY | BAR0 是协议寄存器区,不同内核版本对它的 BAR 测试行为不一;`-w` 能过说明寄存器区实际可读写,不当阻塞项。注意 `-b 0 && -b 1` 会短路,BAR1 要单独跑 |
+| `pcitest -b 0` NOT OKAY | BAR0 是协议寄存器区,不同内核版本对它的 BAR 测试行为不一;`-w` 能过说明寄存器区实际可读写,不当阻塞项。注意 `-b 0 && -b 1` 会短路,BAR1 要单独跑。**带 doorbell 功能的内核(EP dmesg 有 `Doorbell info: bar_no=0, offset=...`)BAR0 测试必然失败**:门铃区是硬件寄存器不是内存;且整段图案写会污染 COMMAND 等协议寄存器(EP 报 `Invalid command 0xcafebabe`),这种平台直接跳过 `-b 0` |
 | `-m 32` / `-x 256` NOT OKAY | 不是中断不通(`-w` 的完成通知就是中断),是**高号向量**不通,通常是 RC 实际分配的向量数少于 EP 声明值。用 `for i in 1 2 4 8 ...; do pcitest -x $i; done` 扫出边界,配合 `/proc/interrupts` 和 `lspci -vv` 的 MSI-X Count 确认。够用即可 |
 | 所有 `-d` NOT OKAY | EP 侧多半没拿到 DMA 通道。查 A 板 dmesg(probe 时 "Failed to get DMA" 类打印、跑 `-d` 时的报错),确认 eDMA 驱动使能。对照:`-w -s 4194304`(不带 `-d` 的大块)排除 buffer 分配问题,`-d -w -s 65536`(小块 DMA)确认是 DMA 本身 |
 

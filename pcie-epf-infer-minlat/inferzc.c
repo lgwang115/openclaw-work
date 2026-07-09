@@ -146,12 +146,26 @@ static int rc_push(int fd, int slot, uint32_t size, uint64_t pci_addr)
 
 static int do_rc_user(int slot, uint32_t size)
 {
-	struct infer_buf_req br;
 	struct infer_credit cr;
 	struct infer_map_req mr = {};
 	int fd, ret = 1;
 	void *map = MAP_FAILED;
+	size_t map_size;
 	__u64 pci = 0;
+
+	/*
+	 * MAP_USER needs normal page-backed VA (anonymous/file pages).
+	 * Do NOT mmap /dev/infer_rc0 staging: dma_mmap_coherent is VM_PFNMAP
+	 * and pin_user_pages returns -EFAULT ("Bad address").
+	 * Keep size to one page unless hugepage/contig allocator is used —
+	 * multi-page anonymous memory is rarely physically contiguous.
+	 */
+	map_size = (size + 4095u) & ~4095u;
+	if (map_size > 4096) {
+		fprintf(stderr,
+			"note: MAP_USER test uses anonymous pages; size>4K may fail "
+			"contiguity check — prefer ./inferzc rc-dmabuf\n");
+	}
 
 	fd = open("/dev/infer_rc0", O_RDWR);
 	if (fd < 0) {
@@ -162,18 +176,10 @@ static int do_rc_user(int slot, uint32_t size)
 		printf("credit posted=0x%x ep_flags=0x%x\n",
 		       cr.posted_mask, cr.ep_flags);
 
-	if (ioctl(fd, INFER_IOC_ALLOC, &br) < 0) {
-		perror("ALLOC");
-		goto out;
-	}
-	if (size > br.size) {
-		fprintf(stderr, "size too big\n");
-		goto out;
-	}
-
-	map = mmap(NULL, br.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	map = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (map == MAP_FAILED) {
-		perror("mmap");
+		perror("mmap anonymous");
 		goto out;
 	}
 	fill_pattern(map, size);
@@ -182,6 +188,8 @@ static int do_rc_user(int slot, uint32_t size)
 	mr.size = size;
 	if (ioctl(fd, INFER_IOC_MAP_USER, &mr) < 0) {
 		perror("MAP_USER");
+		fprintf(stderr,
+			"hint: need page-backed contiguous VA; try ./inferzc rc-dmabuf\n");
 		goto out;
 	}
 	pci = mr.pci_addr;
@@ -192,7 +200,7 @@ static int do_rc_user(int slot, uint32_t size)
 		perror("UNMAP_USER");
 out:
 	if (map != MAP_FAILED)
-		munmap(map, br.size);
+		munmap(map, map_size);
 	close(fd);
 	return ret;
 }

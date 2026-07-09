@@ -246,6 +246,13 @@ static int infer_map_user(struct infer_rc *rc, struct infer_map_req *req)
 			unpin_user_pages(pages, pinned);
 		kfree(pages);
 		mutex_unlock(&rc->map_lock);
+		/*
+		 * Common failure: VA from dma_mmap_coherent / remap_pfn_range
+		 * is VM_PFNMAP and cannot be pinned (-EFAULT).
+		 */
+		dev_dbg(&rc->pdev->dev,
+			"MAP_USER pin_user_pages failed pinned=%d want=%d\n",
+			pinned, nr_pages);
 		return pinned < 0 ? pinned : -EFAULT;
 	}
 

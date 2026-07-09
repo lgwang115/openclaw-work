@@ -56,7 +56,10 @@ struct infer_regs_v2 {
  * RC ioctls — sender on this cable
  * ===================================================================== */
 
-/* Push from an already-mapped PCI bus address (NPU/DDR). No staging copy. */
+/* Push from an already-mapped PCI bus address (NPU/DDR).
+ * pci_addr is per-call: eDMA remote src is programmed from this field
+ * each doorbell, so the NPU buffer may move every transfer.
+ */
 struct infer_push {
 	__u32 slot;
 	__u32 size;
@@ -95,23 +98,30 @@ struct infer_credit {
 
 #define INFER_EP_IOC_MAGIC          'E'
 
-/* Register local destination for a slot (eDMA write target on this SoC). */
+/* Register or re-arm a slot with THIS transfer's local destination.
+ * Address may change every call — eDMA is programmed from these fields
+ * in the doorbell handler (not from a fixed module buffer).
+ */
 struct infer_ep_recv_reg {
 	__u32 slot;
 	__u32 flags;          /* INFER_EP_REG_F_* */
 	__u64 capacity;       /* max bytes this dst can accept */
 	__u64 local_dst;      /* phys/IOVA for EP eDMA — or 0 if using dmabuf_fd */
 	__s32 dmabuf_fd;      /* >=0 if INFER_EP_REG_F_DMABUF */
-	__s32 reserved;
+	__u32 dmabuf_offset;  /* offset within dma-buf for this packet */
 };
 
 #define INFER_EP_REG_F_ADDR         (1u << 0)  /* local_dst valid */
 #define INFER_EP_REG_F_DMABUF       (1u << 1)  /* dmabuf_fd valid */
 #define INFER_EP_REG_F_STAGING      (1u << 2)  /* use driver staging (non-ZC) */
 
-#define INFER_EP_IOC_REG_RECV       _IOW(INFER_EP_IOC_MAGIC, 1, struct infer_ep_recv_reg)
+/* ARM = provide this packet's local_dst and mark slot POSTED (main path). */
+#define INFER_EP_IOC_ARM            _IOW(INFER_EP_IOC_MAGIC, 1, struct infer_ep_recv_reg)
+/* Alias kept for docs that said REG_RECV; same payload as ARM. */
+#define INFER_EP_IOC_REG_RECV       INFER_EP_IOC_ARM
 #define INFER_EP_IOC_UNREG          _IOW(INFER_EP_IOC_MAGIC, 2, __u32) /* slot */
 
+/* Optional: re-POST same local_dst without re-passing address (rare). */
 struct infer_ep_post {
 	__u32 slot;
 	__u32 flags;          /* 0 */
@@ -131,16 +141,14 @@ struct infer_ep_wait {
 #define INFER_EP_IOC_WAIT           _IOWR(INFER_EP_IOC_MAGIC, 4, struct infer_ep_wait)
 
 /*
- * Pseudocode — A→B zero-copy message
+ * Pseudocode — A→B zero-copy, addresses may change every packet
  *
- *   // B
- *   REG_RECV(slot=0, dmabuf_fd=npu_dst_fd, capacity=...)
- *   POST(slot=0)
- *   // A
- *   MAP_USER or runtime-provided pci_addr for npu_src
- *   PUSH({slot=0, size, pci_addr})
- *   // B
- *   WAIT(slot=0) -> DONE; hand buffer to NPU; POST again
+ *   // B (new NPU_dst each time, or reuse)
+ *   ARM(slot=0, local_dst=npu_dst_iova, capacity=...)
+ *   // A (new NPU_src each time, or reuse mapped pci_addr)
+ *   PUSH({slot=0, size, pci_addr=npu_src_bus_addr})
+ *   // B doorbell path programs eDMA with THIS pci_addr + THIS local_dst
+ *   WAIT(slot=0) -> DONE; next packet ARM(new addr) again
  */
 
 #endif /* _INFER_PROTO_V2_H_ */

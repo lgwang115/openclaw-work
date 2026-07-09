@@ -7,7 +7,7 @@
 > 实测结果（IRQ→eDMA 直提后）：4KB 中位约 **17µs**，2MB 带宽约 **6.0～6.1 GB/s**  
 > （此前门铃→workqueue 路径约 24µs / 6.2 GB/s，见下文对照表）
 
-本文记录从「自研内核模块」开始到「板子上跑通 `inferlat`」的全部工作：设计动机、平台坑、编译部署、板测步骤、验收标准与实测数据。
+本文记录从「自研内核模块」开始到「板子上跑通 `inferlat` / v2 零拷贝接口」的全部工作：设计动机、平台坑、编译部署、板测步骤、验收标准与实测数据。
 
 ---
 
@@ -17,6 +17,7 @@
 
 1. 可靠的 RC↔EP 内存搬运（DMA）
 2. **端到端延迟尽量低**（尤其是 4KB 小包）
+3. 可指定 NPU 可见地址的零拷贝推送（v2）
 
 前期用 BSP 自带的 `pci_epf_test` + `pcitest` 验证了链路与 DMA 吞吐（约 6.5 GB/s），但用其做延迟测量（`dmalat`）得到 **2～5 ms**，远高于链路能力。根因是框架开销，不是物理链路：
 
@@ -28,9 +29,10 @@
 
 因此自研一套 **门铃触发 + 状态寄存器轮询 + 预分配 DMA** 的最小延迟栈，目标：
 
-- 4KB 端到端：**20～40µs**
+- 4KB 端到端：**20～40µs**（IRQ→eDMA 直提后实测中位 **~17µs**）
 - 大包带宽：接近 `pcitest` DMA 峰值（~6 GB/s）
 - 关键路径 **不依赖 MSI**
+- v2：双缆单向 WRITE + per-transfer ADDR/DMABUF（见 `ZEROCOPY.md`）
 
 ---
 
@@ -40,11 +42,14 @@
 
 | 文件 | 角色 | 装在哪 |
 | --- | --- | --- |
-| `pci_epf_infer.c` | EP function 驱动（`#include ../../controller/bst/pcie-bst.h`） | 每板的 EP 口（`73000000.pcie2_ep`） |
-| `infer_rc.c` | RC 主机驱动 | 每板的 RC 口（枚举到的 `0000:01:00.0`） |
-| `infer_proto.h` | 共享协议（magic / 寄存器布局 / ioctl） | 两边模块 + 用户态共用 |
-| `inferlat.c` | 用户态延迟扫表（4KB→2MB） | RC 侧用户态 |
-| `install-into-kernel.sh` | 拷进内核树并编 `.ko` | 开发机 |
+| `pci_epf_infer.c` | EP function（门铃 IRQ→eDMA；v1 staging + v2 POST_RECV） | 每板 EP 口（`73000000.pcie2_ep`） |
+| `infer_rc.c` | RC 主机驱动（`XFER`/`PUSH`/`MAP_*`） | 每板 RC 口（`0000:01:00.0`） |
+| `infer_proto.h` / `infer_proto_v2.h` | 共享协议 | 两边模块 + 用户态 |
+| `inferlat.c` | v1 延迟扫表（4KB→2MB） | RC 侧用户态 |
+| `inferpush.c` | v2 staging smoke | 两端用户态 |
+| `inferzc.c` | v2 MAP_USER / MAP_DMABUF smoke | 两端用户态 |
+| `infer_dmabuf_test.c` | 测试用连续 dma-buf 导出 | 两端（可选） |
+| `install-into-kernel.sh` | 拷进内核树并编 `.ko` + 用户态工具 | 开发机 |
 
 设备 ID 故意用 **`1ef1:0301`**（不用 `0300`），避免和 `pci_epf_test` / `pci-endpoint-test` 冲突。
 
@@ -127,17 +132,25 @@ BST 控制器在 `start` 时重新初始化，**bind 阶段 `pci_epc_set_bar` �
 - `callback_param` 不能指向栈上临时对象（UAF）
 - 超时必须 `dmaengine_terminate_sync`，避免迟到回调
 
-### 3.7 成对重启纪律
+### 3.7 门铃 IRQ 直接提交 eDMA（延迟优化）
+
+早期路径：门铃 IRQ → `queue_work(system_highpri_wq)` → worker 里 submit eDMA。  
+当前路径：门铃 IRQ **直接** `prep` + `submit` eDMA，DMA callback 写 status；用 `ctx->busy` 保证单 outstanding。  
+板测：4KB 中位从 ~24µs 降到 **~17µs**（约再降 7µs）。
+
+### 3.8 成对重启纪律
 
 软 `remove` + `rescan` **不能**可靠恢复对端 EP 被 RC 复位后的 BAR 尺寸掩码（曾出现 BAR1 变成 8MB 等异常）。  
 **两板一起 reboot**，再按「先两边 EP ready，再各自 RC 枚举」的顺序操作。
 
-### 3.8 其它操作注意
+### 3.9 其它操作注意
 
 - 不要跑 `pcitest -c`（会挂）
 - 不要对 BAR0 做普通 `-b 0` 功能测试（门铃/MSI-X 表区域）
 - MSI 在本链路偶发失效；本方案关键路径用 **status 轮询**，不依赖 MSI
 - `busybox devmem` 在设备 **未 enable Memory Space** 前读 BAR 会得到 `0xFFFFFFFF`；以 `insmod infer_rc` 之后的 dmesg 为准
+- `MAP_USER` 不要 mmap RC staging（`VM_PFNMAP` → `Bad address`）；用匿名页或 `rc-dmabuf`
+- dma-buf 模块需 `MODULE_IMPORT_NS(DMA_BUF)`
 
 ---
 
@@ -168,7 +181,8 @@ export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
 ```
 ~/workspace/linux-6.6/drivers/pci/endpoint/functions/pci_epf_infer.ko
 ~/workspace/linux-6.6/drivers/misc/infer_rc.ko
-./inferlat
+~/workspace/linux-6.6/drivers/misc/infer_dmabuf_test.ko
+./inferlat ./inferpush ./inferzc
 ```
 
 ### 4.3 拷到两块板（拓扑对称，每板都要 EP+RC）
@@ -183,13 +197,15 @@ for IP in $BOARD_A $BOARD_B; do
   ssh root@$IP 'mkdir -p /userdata/ep_test'
   scp $KDIR/drivers/pci/endpoint/functions/pci_epf_infer.ko \
       $KDIR/drivers/misc/infer_rc.ko \
-      $SRC/inferlat \
+      $KDIR/drivers/misc/infer_dmabuf_test.ko \
+      $SRC/inferlat $SRC/inferpush $SRC/inferzc \
       root@$IP:/userdata/ep_test/
 done
 
 # 建议核对 md5，避免板子上还是旧 ko
 md5sum $KDIR/drivers/pci/endpoint/functions/pci_epf_infer.ko \
-       $KDIR/drivers/misc/infer_rc.ko
+       $KDIR/drivers/misc/infer_rc.ko \
+       $KDIR/drivers/misc/infer_dmabuf_test.ko
 ssh root@$BOARD_A 'md5sum /userdata/ep_test/*.ko'
 ssh root@$BOARD_B 'md5sum /userdata/ep_test/*.ko'
 ```
@@ -314,6 +330,25 @@ chmod +x ./inferlat
 | 2MB 带宽 | 约 **6 GB/s** 量级 |
 | w / r | 延迟大致对称 |
 | v2 smoke | `inferpush` / `inferzc` PUSH 成功（单次 ~42µs，冷启动） |
+| `/dev/pci_epf_infer0` | EP `insmod` 后存在（v2 收包） |
+
+### 5.5 v2 零拷贝 smoke（可选）
+
+成对 EP/RC ready 后：
+
+```bash
+# 接收板
+cd /userdata/ep_test
+./inferpush ep 0 4096
+# 或: insmod ./infer_dmabuf_test.ko && ./inferzc ep 0 4096
+
+# 发送板（60s 内）
+./inferpush rc 0 4096
+# 或: ./inferzc rc 0 4096
+# 或: insmod ./infer_dmabuf_test.ko && ./inferzc rc-dmabuf 0 4096
+```
+
+期望：EP `WAIT result=0` + `payload OK`；RC `PUSH result=0`。细节见 `ZEROCOPY.md`。
 
 ---
 
@@ -385,6 +420,10 @@ chmod +x ./inferlat
 | `inferlat` open 失败 | 无 `/dev/infer_rc0`，先看 `infer_rc` probe |
 | 传输超时 | 对端 EP 未加载 / doorbell 未 setup / eDMA 失败；看两边 dmesg |
 | eth2/eth3 `phy_poll_reset failed` | 与 PCIe 无关，可忽略 |
+| `MAP_USER` → `Bad address` | 不要 mmap RC staging（`VM_PFNMAP`）；用匿名页或 `rc-dmabuf` |
+| MAP_* / EP DMABUF `-EINVAL` | 映射不是单连续 SG 段 |
+| `inferpush` EP WAIT 超时 | RC 未在 60s 内 PUSH；先起 EP 再起 RC |
+| modpost `DMA_BUF` namespace | 模块缺 `MODULE_IMPORT_NS(DMA_BUF)` |
 
 ---
 
@@ -436,10 +475,12 @@ dmesg | grep infer_rc | tail -5
 ## 9. 已知限制与后续
 
 1. **成对重启**：BST EP 被对端 RC 复位后的软恢复未彻底修好，日常仍建议双板一起 reboot。
-2. **DMA 落点**：当前 EP 把数据搬进本地 4MB coherent 缓冲；真正接 NPU 时需把缓冲换成 NPU 可见内存 / IOMMU 映射。
-3. **单实例**：`/dev/pci_epf_infer_ctl` 与全局 `g_epf_infer` 目前按单 function 设计。
-4. **完成通知**：关键路径用 status 轮询；若以后 MSI 稳定，可作可选加速，但不要作为唯一完成路径。
-5. **双链路 EP2**：每板 EP 模块 + 对板 RC 模块已打通；上层推理调度可在此数据面上叠。
+2. **v1 DMA 落点**：`inferlat` 仍走 EP 本地 4MB staging；业务收包用 v2 `POST_RECV`/`WAIT`（ADDR/DMABUF）。
+3. **单 outstanding**：同缆 `ctx->busy` 串行；双缆独立。多线程同缆需用户态锁/队列。
+4. **单 SG 段**：`prep_slave_single` 要求 MAP_USER / MAP_DMABUF / EP DMABUF 映射为单连续段。
+5. **单实例**：`/dev/pci_epf_infer_ctl` 与全局 `g_epf_infer` 目前按单 function 设计。
+6. **完成通知**：关键路径用 status 轮询；若以后 MSI 稳定，可作可选加速，但不要作为唯一完成路径。
+7. **P3 待做**：真实 NPU runtime 的 dma-buf / IOVA 接入（当前 smoke 用 staging 或 `infer_dmabuf_test`）。
 
 ---
 
@@ -447,10 +488,14 @@ dmesg | grep infer_rc | tail -5
 
 - 简要说明：`README.md`
 - 编译细节：`BUILD.md`
-- 协议头：`infer_proto.h`
-- 分支：`cursor/pcie-epf-infer-minlat-888f`
-- 关键修复提交：
+- 零拷贝协议与板测：`ZEROCOPY.md`
+- 协议头：`infer_proto.h` / `infer_proto_v2.h`
+- 前期链路验证（`pci_epf_test`）：仓库根目录 `pcie-ep-rc-pci-epf-test-communication.md`
+- 分支：`cursor/pcie-epf-infer-minlat-888f`（PR #4）
+- 关键修复 / 演进：
   - 进树编译 / 6.6 probe 适配
   - post-start reprogram（`/dev/pci_epf_infer_ctl`）
   - eDMA slave + 回调/超时修复
   - **控制寄存器从 BAR0 迁到 BAR1**（主机可见 magic 的根因修复）
+  - v2：`POST_RECV`/`PUSH`/`MAP_USER`/`MAP_DMABUF` + `inferpush`/`inferzc`
+  - **门铃 IRQ 直接 submit eDMA**（4KB ~24µs → ~17µs）

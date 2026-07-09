@@ -1,15 +1,16 @@
 # 零拷贝 NPU 互联协议（双缆单向推送）
 
-> 状态：**驱动已接线**（P1/P2）；真实 NPU runtime 联调为 P3。  
-> v1 延迟基线（staging + `INFER_IOC_XFER`）：4KB 中位 **~17µs**，见 `BRINGUP.md`。  
-> 本文件 + `infer_proto_v2.h` 描述接口与拓扑；实现见 `pci_epf_infer.c` / `infer_rc.c`。
+> 状态：**驱动已接线并板测通过**（P1/P2）；真实 NPU runtime 联调为 P3。  
+> v1 延迟基线（staging + `INFER_IOC_XFER`，门铃 IRQ→eDMA 直提）：4KB 中位 **~17µs**，见 `BRINGUP.md`。  
+> 本文件 + `infer_proto_v2.h` 描述接口与拓扑；实现见 `pci_epf_infer.c` / `infer_rc.c`。  
+> 工具：`inferpush`（staging smoke）、`inferzc`（MAP_USER / MAP_DMABUF）、`infer_dmabuf_test.ko`。
 
 ## 1. 目标
 
 - 双缆 PCIe Gen4 x4：每板既是 RC 又是 EP
 - **推理卡互联**：A↔B 传 activation / KV / 中间结果
 - **避免 staging 搬运**：eDMA 直接在「发送方 NPU 可见地址」与「接收方 NPU 可见地址」之间搬
-- 保持低延迟完成路径：门铃 + status 轮询（不依赖 MSI）
+- 保持低延迟完成路径：门铃 IRQ → **直接 submit eDMA** → DMA callback 写 status（不依赖 MSI）
 
 ## 2. 拓扑与方向
 
@@ -23,8 +24,10 @@
 | A→B | A 的 `/dev/infer_rc0` | **B** 的 EP eDMA | B 本板已注册的 NPU dst |
 | B→A | B 的 `/dev/infer_rc0` | **A** 的 EP eDMA | A 本板已注册的 NPU dst |
 
-**不用 READ 做 recv。** READ 会走错链路/错 EP 缓冲（见此前分析）。  
-v2 数据面命令以 **WRITE（远端读 → 本地写）** 为主；READ 仅保留给调试/回读。
+**不用 READ 做 recv。** READ 会走错链路/错 EP 缓冲。  
+v2 数据面命令以 **WRITE（远端读 → 本地写）** 为主；READ 仅保留给调试/回读（`inferlat r`）。
+
+同缆 **单 outstanding**（EP `ctx->busy`）；多线程同缆需用户态串行化。双缆各自独立。
 
 ## 3. 为什么 v1 不够
 
@@ -37,7 +40,7 @@ NPU_src →(可能拷)→ RC staging(buf_dma) → eDMA → EP staging(4MB) →(�
 问题：
 
 1. 两端都钉死驱动私有 staging
-2. EP 收包后用户态读不到 EP 本地缓冲
+2. EP 收包后用户态读不到 EP 本地缓冲（v1 无 `/dev/pci_epf_infer0` 收包接口）
 3. 对端 `infer_rc` 连的是另一条缆的 EP，拉不回这份数据
 
 v2 目标：
@@ -58,20 +61,20 @@ NPU_dst (B 本板 eDMA 本地地址)
 平台前提（已确认）：**eDMA 可以读写 NPU buffer**，但地址不是固定的——  
 每次传输的 src/dst 位置可能不同，必须在发起 DMA 前把**当次**地址告诉 eDMA（`dma_slave_config` / `prep_slave_single`）。
 
-因此协议默认是 **per-transfer 地址编程**，而不是「注册一次用一辈子」：
+因此协议默认是 **per-transfer 地址编程**：
 
-- 发送方：每次 `PUSH` 都带本次 `pci_addr`（NPU_src 经 `dma_map` 后的总线地址）
-- 接收方：每次 `POST_RECV`都带本次 `local_dst`（NPU_dst）
-- 驱动在门铃处理里用这两次传入的地址配置 eDMA，打完即丢（或仅缓存到 DONE）
+- 发送方：每次 `PUSH` 都带本次 `pci_addr`（经 `dma_map` / `MAP_USER` / `MAP_DMABUF`）
+- 接收方：每次 `POST_RECV` 都带本次 `local_dst`（ADDR / DMABUF / STAGING）
+- 门铃 IRQ 里用这两次传入的地址配置 eDMA，打完即丢（或仅缓存到 DONE）
 
-长期 pin/map 可以做（同一块 NPU 缓冲反复用），但是**可选优化**；API 必须允许每包换地址。
+发送方要对 **本板 PCIe RC 设备**（`infer_rc` 的 `pdev`）做 `dma_map_*`。  
+接收方 `local_dst` 必须是 **本板 EP eDMA 能写的** 地址。
 
-发送方要对 **本板 PCIe RC 设备**（`infer_rc` 的 `pdev`）做 `dma_map_*`，得到的才是合法 `pci_addr`。  
-接收方 `local_dst` 必须是 **本板 EP eDMA 能写的** NPU/共享 DDR 地址（物理或该 DMA 设备的 IOVA）。
+限制：当前用 `prep_slave_single`，**MAP_USER / MAP_DMABUF / EP DMABUF 都要求映射结果为单个连续 DMA 段**；多段 SG 返回 `-EINVAL`。
 
 ## 5. 槽位模型（双缓冲起步）
 
-每条 EP 链路维护 `INFER_V2_SLOTS`（建议 2）个接收槽，用于流水（一包 DMA 时另一包可先 POST_RECV）：
+每条 EP 链路维护 `INFER_V2_SLOTS`（建议 2）个接收槽：
 
 ```
 slot[i]:
@@ -83,7 +86,7 @@ slot[i]:
 - **BUSY**：门铃已响，eDMA 正用该 `local_dst` 写入
 - **DONE**：完成；用户态收走后再次 POST_RECV（可换新地址）
 
-发送方在 PUSH 前应看到对端 credit（`posted_mask`），避免覆盖未收完的槽。
+发送方在 PUSH 前应看到对端 credit（`INFER_IOC_GET_CREDIT` → `posted_mask`）。
 
 ## 6. 一次 A→B 推送时序（每包换地址）
 
@@ -93,19 +96,19 @@ B (EP / recv) — 本包 NPU_dst 可能与上包不同:
        → 驱动记下 slot.local_dst；slot=POSTED；更新 posted_mask
 
 A (RC / send) — 本包 NPU_src 也可能不同:
-  2. dma_map(本次 NPU_src) → pci_addr   （或复用已 map 的地址）
-  3. 确认 posted_mask 含该 slot
+  2. dma_map / MAP_USER / MAP_DMABUF → pci_addr
+  3. 确认 posted_mask 含该 slot（GET_CREDIT）
   4. INFER_IOC_PUSH { slot, size, pci_addr, timeout }
        → 写 BAR1；响门铃；轮询 status
 
 B (EP):
-  5. 门铃 → workqueue
+  5. 门铃 IRQ → 直接 submit eDMA（无 workqueue；ctx->busy 单 outstanding）
   6. 校验 slot==POSTED && size<=capacity
   7. eDMA 编程（关键）:
        remote src = regs->pci_addr      // 当次远端 NPU_src
        local  dst = slot.local_dst      // 当次本板 NPU_dst
        len        = size
-  8. status=OK；slot=DONE；seq++
+  8. DMA callback: status=OK；slot=DONE；seq++
   9. WAIT → 用户态/NPU 消费；下一包再 POST_RECV(新地址)
 ```
 
@@ -113,7 +116,7 @@ B (EP):
 
 ## 7. BAR1 寄存器扩展（相对 v1）
 
-v1 `infer_regs` 保留兼容；v2 在其后追加字段（或使用同一结构的 `reserved` 升级），见 `infer_proto_v2.h`：
+v1 `infer_regs` 保留兼容；v2 字段见 `infer_proto_v2.h`：
 
 | 字段 | 谁写 | 含义 |
 | --- | --- | --- |
@@ -121,56 +124,62 @@ v1 `infer_regs` 保留兼容；v2 在其后追加字段（或使用同一结构�
 | `slot` | RC | 目标接收槽 |
 | `seq` | EP | 完成序号 |
 | `posted_mask` | EP | bit i = slot i 已 POSTED |
-| `done_mask` | EP | bit i = slot i DONE（可选，便于 RC 侧调试） |
-| `local_dst` | — | **不放 BAR**（对端不该知道本板物理地址）；每次 POST_RECV 只进 EP 内核 |
+| `done_mask` | EP | bit i = slot i DONE |
+| `local_dst` | — | **不放 BAR**；每次 POST_RECV 只进 EP 内核 |
 
-门铃仍在 BAR0+`db_offset`。
+门铃仍在 BAR0+`db_offset`（通常 `0xe00`）。
 
-## 8. ioctl 草案
+## 8. 已实现 ioctl
 
 ### 8.1 RC（`/dev/infer_rc0`）— 发送侧
 
-| ioctl | 作用 |
+| ioctl | 状态 | 作用 |
+| --- | --- | --- |
+| `INFER_IOC_PUSH` | **已实现** | **每次**带 `pci_addr`+`size`+`slot`，门铃+轮询 |
+| `INFER_IOC_XFER` | **已实现** | **保留 v1**：驱动 staging，`inferlat` 回归延迟 |
+| `INFER_IOC_MAP_USER` / `UNMAP_USER` | **已实现** | VA → `pci_addr`（要求 pin+map 成单段） |
+| `INFER_IOC_MAP_DMABUF` / `UNMAP_DMABUF` | **已实现** | dma-buf fd → `pci_addr`（单段） |
+| `INFER_IOC_GET_CREDIT` | **已实现** | 读对端 `posted_mask` / `done_mask` / `seq` |
+
+运行时若已有 NPU 导出的总线地址，可直接 `PUSH`，驱动不保管缓冲。
+
+### 8.2 EP（`/dev/pci_epf_infer0`）— 接收侧
+
+| ioctl | 状态 | 作用 |
+| --- | --- | --- |
+| `INFER_EP_IOC_POST_RECV` | **已实现** | **每次**带 dst（ADDR / STAGING / **DMABUF**）→ POSTED |
+| `INFER_EP_IOC_WAIT` | **已实现** | 等 slot → DONE（默认最长 60s） |
+| `INFER_EP_IOC_GET_INFO` | **已实现** | 查询 slot / credit / staging 信息 |
+| `INFER_EP_IOC_ARM` | 别名 | 兼容旧名，等同 `POST_RECV` |
+
+`POST_RECV` 的 `flags`：
+
+| flag | 含义 |
 | --- | --- |
-| `INFER_IOC_PUSH` | **每次**带 `pci_addr`+`size`+`slot`，门铃+轮询 |
-| `INFER_IOC_XFER` | **保留 v1**：驱动 staging，回归延迟 |
-| `INFER_IOC_MAP_USER`（可选） | VA → `pci_addr`；可每包 map，或 map 一次多包复用 |
-| `INFER_IOC_GET_CREDIT`（可选） | 读对端 `posted_mask` |
+| `INFER_EP_REG_F_STAGING` | 写进 EP 预分配 4MB（smoke / 非零拷贝） |
+| `INFER_EP_REG_F_ADDR` | 显式 `local_dst` |
+| `INFER_EP_REG_F_DMABUF` | dma-buf fd + offset → local_dst |
 
-运行时若已有 NPU/dma-buf 导出的总线地址，直接 `PUSH`，驱动不保管缓冲。
+eDMA 编程点：门铃 IRQ 里用 **本包** `regs->pci_addr` 与 **本包** `slot.local_dst`，不要默认用固定 `ctx->buf_dma`（除非选了 staging）。
 
-### 8.2 EP（新 `/dev/pci_epf_infer0`）— 接收侧
+## 9. 平台验证（能力已确认，剩 NPU 联调）
 
-| ioctl | 作用 |
-| --- | --- |
-| `INFER_EP_IOC_POST_RECV` | **每次**带 `local_dst`+`capacity`+`slot` → POSTED（推荐主路径；旧名 ARM 已弃用） |
-| `INFER_EP_IOC_WAIT` | 等 slot → DONE |
-| `INFER_EP_IOC_REG_RECV` | 可选：长期绑定某 slot 的默认 dst（仍允许 POST_RECV 覆盖） |
+已确认：
 
-`local_dst` 来源：
+1. **eDMA ↔ NPU buffer 可读可写**（平台侧）
+2. 每包把地址喂给 eDMA（slave config + prep）已接线
+3. 测试用连续 dma-buf（`infer_dmabuf_test.ko`）两端对称通路已板测通过
+4. 双 slot 协议字段已有；当前关键路径仍单 outstanding（`ctx->busy`）
 
-1. **dma-buf fd**（接 NPU runtime，每包或每层换 fd/offset 均可）
-2. 显式 IOVA/物理地址（调试 / 已翻译好的 NPU 地址）
-3. staging（兼容，非零拷贝）
-
-eDMA 编程点（实现时务必）：在门铃 work 里用 **本包** 的 `regs->pci_addr` 与 **本包** 的 `slot.local_dst`，不要用模块加载时分配的固定 `ctx->buf_dma`（除非 POST_RECV 显式选了 staging）。
-
-## 9. 平台验证（能力已确认，剩联调）
-
-已确认：**eDMA ↔ NPU buffer 可读可写**。实现时重点变成：
-
-1. **每包把地址喂给 eDMA**（slave config + prep），换地址不重启通道即可
-2. RC 侧 `dma_map(NPU_src)` 得到的 `pci_addr` 对端能否读到（图案校验）
-3. 对齐 / 最大段长；不对齐则头尾补齐
-4. 双 slot：一包 BUSY 时另一包可先 POST_RECV 新地址，避免气泡
+P3 重点：把真实 NPU runtime 的 dma-buf fd / IOVA 接到 `POST_RECV` / `MAP_DMABUF`。
 
 ## 10. 分阶段落地
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| P0 | 文档 + `infer_proto_v2.h` | 评审通过 |
-| **P1/P2（已接线+板测）** | EP：`POST_RECV`/`WAIT`（ADDR/STAGING/**DMABUF**）；RC：`PUSH` + **`MAP_USER`/`MAP_DMABUF`** + `GET_CREDIT` | `inferpush` / `inferzc` 通过；v1 `inferlat` 4KB ~17µs |
-| P3 | 用真实 NPU/dma-buf 地址做端到端零拷贝联调 | payload 进 NPU buffer |
+| P0 | 文档 + `infer_proto_v2.h` | 完成 |
+| **P1/P2（已接线+板测）** | EP：`POST_RECV`/`WAIT`（ADDR/STAGING/**DMABUF**）；RC：`PUSH` + **`MAP_USER`/`MAP_DMABUF`** + `GET_CREDIT`；IRQ→eDMA | `inferpush` / `inferzc` 通过；`inferlat` 4KB ~17µs |
+| P3 | 真实 NPU/dma-buf 端到端零拷贝 | payload 进 NPU buffer |
 | P4 | 推理 runtime 绑定 | 业务路径 |
 
 ### MAP_USER / DMABUF 用法（runtime）
@@ -200,22 +209,9 @@ ioctl(ep_fd, INFER_EP_IOC_POST_RECV, &r);
 ioctl(ep_fd, INFER_EP_IOC_WAIT, &w);
 ```
 
-限制：当前 eDMA 路径用 `prep_slave_single`，**MAP_USER / MAP_DMABUF / EP DMABUF 都要求映射结果为单个连续 DMA 段**；多段 SG 返回 `-EINVAL`。
+注意：`inferzc rc` 的用户缓冲必须是 **匿名可 pin 页**（不要 mmap RC staging `VM_PFNMAP`，会 `Bad address`）。连续缓冲优先用 `rc-dmabuf`。
 
-### 板测对称 dma-buf（两端都用 fd）
-
-```bash
-# 接收板
-insmod infer_dmabuf_test.ko
-./inferzc ep 0 4096
-
-# 发送板
-insmod infer_dmabuf_test.ko
-./inferzc rc-dmabuf 0 4096
-```
-
-
-### 板测 v2 smoke（EP staging，验证通路）
+### 板测 v2 smoke（EP staging）
 
 成对重启并完成 EP reprogram + RC `insmod` 后：
 
@@ -226,7 +222,7 @@ insmod infer_dmabuf_test.ko
 ./inferpush rc 0 4096          # PUSH；EP 应打印 payload OK
 ```
 
-期望：EP `WAIT result=0` 且 **`payload OK`**；RC `PUSH result=0`。
+期望：EP `WAIT result=0` 且 **`payload OK`**；RC `PUSH result=0`（单次冷启动约 ~42µs）。
 
 ### 板测 v2 零拷贝接口（MAP_USER + DMABUF）
 
@@ -236,15 +232,28 @@ insmod /userdata/ep_test/infer_dmabuf_test.ko
 ./inferzc ep 0 4096
 # 期望: POST_RECV DMABUF ... WAIT result=0 ... payload OK via DMABUF
 
-# 发送板（60s 内）
+# 发送板（60s 内）— MAP_USER
 ./inferzc rc 0 4096
 # 期望: MAP_USER ... -> pci_addr=... ; PUSH result=0
+
+# 或对称 dma-buf
+insmod /userdata/ep_test/infer_dmabuf_test.ko
+./inferzc rc-dmabuf 0 4096
+# 期望: MAP_DMABUF -> pci_addr=... ; PUSH result=0
 ```
 
-换 NPU 地址时：EP `POST_RECV` 用 `INFER_EP_REG_F_ADDR` 或 NPU 导出的 dma-buf；RC `PUSH.pci_addr` 用已 `dma_map` / `MAP_USER` 的 NPU_src。
+### 板测实测摘要（2026-07）
 
+| 路径 | 结果 | 说明 |
+| --- | --- | --- |
+| `inferlat` WRITE/READ | 4KB 中位 ~17µs；2MB ~6.0–6.1 GB/s | v1 staging，预热扫表 |
+| `inferpush rc` | `result=0`，~42.6µs | staging PUSH，单次冷启动 |
+| `inferzc rc` | `result=0`，~42.6µs | MAP_USER |
+| `inferzc rc-dmabuf` | `result=0`，~43.2µs | MAP_DMABUF |
 
-## 11. 明确不做的事（本草案）
+完整 `inferlat` 表见 `BRINGUP.md` §6。
+
+## 11. 明确不做的事
 
 - 不靠 READ 实现跨板 recv
 - 不把 NPU 私有地址不经 map 直接塞进 `pci_addr`
@@ -253,6 +262,6 @@ insmod /userdata/ep_test/infer_dmabuf_test.ko
 
 ## 12. 与 v1 的关系
 
-- v1 模块与 `inferlat` **保持可用**（延迟基线）
-- v2 用新 command / 新 ioctl 号；`INFER_IOC_XFER` 不删除
-- 设备 ID 可暂仍 `1ef1:0301`；若需并行加载两套协议，再议 `0302`
+- v1 模块与 `inferlat` **保持可用**（延迟基线；IRQ→eDMA 后 4KB ~17µs）
+- v2 用新 command / 新 ioctl；`INFER_IOC_XFER` 不删除
+- 设备 ID 暂仍 `1ef1:0301`；若需并行加载两套协议，再议 `0302`

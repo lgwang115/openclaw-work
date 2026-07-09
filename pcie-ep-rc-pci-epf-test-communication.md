@@ -180,6 +180,11 @@ dmesg | tail
 `pci_epf_test` 只是链路验证工具，跑通它说明**枚举、BAR、MSI/MSI-X、EP 主动 DMA、双向数据完整性**全部就绪。推理数据面有两条路：
 
 1. **快速打通：IP over PCIe。** EP 侧换 `pci_epf_vntb`（RC 侧配 `ntb_transport` + `ntb_netdev`），两板之间出一个虚拟网卡，直接跑 TCP/IP。已有的推理框架 RPC/张量传输代码不用改就能先跑起来，代价是协议栈开销，带宽利用率一般在线速的一半上下。
-2. **正式方案：自定义 EPF 驱动。** 参考 `pci_epf_test` 的骨架写自己的 function 驱动：BAR0 放控制寄存器/门铃，张量数据用 EP 侧 eDMA 直接搬 RC 内存，完成通知走 MSI-X。这条路能吃满 Gen4 x4 带宽，是 EP2 推理该有的形态；`pcitest -d` 的结果就是它的带宽上限预演。
+2. **正式方案：自定义 EPF 驱动（已落地）。** 见仓库目录 **`pcie-epf-infer-minlat/`**：
+   - 门铃 IRQ → 直接 submit eDMA + status 轮询（不依赖 MSI）
+   - 控制面在 **BAR1**，门铃在 BAR0+`0xe00`
+   - v1：`inferlat` 实测 4KB 中位 **~17µs**，2MB ~6 GB/s
+   - v2：双缆单向 WRITE + `POST_RECV`/`PUSH` + `MAP_USER`/`MAP_DMABUF`（`ZEROCOPY.md`）
+   - 文档入口：`pcie-epf-infer-minlat/README.md`、`BRINGUP.md`、`BUILD.md`、`ZEROCOPY.md`
 
-建议先用路线 1 把两板推理业务联调起来，同时并行开发路线 2。
+建议：链路验证继续用本文的 `pcitest`；延迟与零拷贝数据面切到 `pcie-epf-infer-minlat`。

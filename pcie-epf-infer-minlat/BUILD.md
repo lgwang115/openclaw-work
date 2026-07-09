@@ -1,6 +1,23 @@
 # 编译与部署（针对 linux-6.6.64-rt47）
 
-完整板测流程、平台坑与实测数据见 **`BRINGUP.md`**。本文只覆盖编译、拷板、加载顺序与常见编译/加载错误。
+完整板测流程、平台坑与实测数据见 **`BRINGUP.md`**。  
+零拷贝接口与 v2 smoke 见 **`ZEROCOPY.md`**。  
+本文只覆盖编译、拷板、加载顺序与常见编译/加载错误。
+
+## 产物一览
+
+| 产物 | 来源 | 用途 |
+| --- | --- | --- |
+| `pci_epf_infer.ko` | EP 进树编 | 本板 EP function + `/dev/pci_epf_infer_ctl` + `/dev/pci_epf_infer0` |
+| `infer_rc.ko` | RC 进树编 | 对端 EP 的 RC 主机驱动 `/dev/infer_rc0` |
+| `infer_dmabuf_test.ko` | misc 进树编 | 测试用连续 dma-buf（`/dev/infer_dmabuf_test`） |
+| `inferlat` | 用户态 | v1 延迟扫表（4KB→2MB） |
+| `inferpush` | 用户态 | v2 staging smoke |
+| `inferzc` | 用户态 | v2 MAP_USER / MAP_DMABUF smoke |
+
+拓扑对称：**A/B 两板都要**上述全部产物。
+
+验收参考（IRQ→eDMA 直提后）：`inferlat` 4KB 中位 **~17µs**，2MB **~6 GB/s**。
 
 ## 推荐：装进内核树再编（能链上 BST 门铃符号）
 
@@ -20,15 +37,18 @@ chmod +x install-into-kernel.sh
 
 脚本会：
 
-1. 把 `pci_epf_infer.c` / `infer_proto.h` 拷到 `drivers/pci/endpoint/functions/`
-2. 把 `infer_rc.c` / `infer_proto.h` 拷到 `drivers/misc/`
+1. 把 `pci_epf_infer.c` / `infer_proto.h` / `infer_proto_v2.h` 拷到 `drivers/pci/endpoint/functions/`
+2. 把 `infer_rc.c` / `infer_dmabuf_test.*` / 协议头拷到 `drivers/misc/`
 3. 在对应 `Makefile` 里追加 `obj-m += ...`
 4. 编出：
    - `.../functions/pci_epf_infer.ko`
    - `.../misc/infer_rc.ko`
-   - `./inferlat`
+   - `.../misc/infer_dmabuf_test.ko`
+   - `./inferlat` `./inferpush` `./inferzc`
 
 为什么要进树编：`bst_pcie_ep_db_*` 多半没有 `EXPORT_SYMBOL`，`pci_epf_test` 是 `=y` 内置所以能调；外部 `.ko` 会报 `Unknown symbol`。
+
+dma-buf 相关模块需 `MODULE_IMPORT_NS(DMA_BUF)`（脚本拷入的源码已带）；否则 modpost 会报命名空间错误。
 
 ## 手动编译（等价于脚本）
 
@@ -42,11 +62,14 @@ grep -q pci_epf_infer.o $KDIR/drivers/pci/endpoint/functions/Makefile || \
   echo 'obj-m += pci_epf_infer.o' >> $KDIR/drivers/pci/endpoint/functions/Makefile
 make -C $KDIR M=drivers/pci/endpoint/functions pci_epf_infer.ko
 
-# RC
-cp infer_rc.c infer_proto.h infer_proto_v2.h $KDIR/drivers/misc/
+# RC + dmabuf test
+cp infer_rc.c infer_proto.h infer_proto_v2.h \
+   infer_dmabuf_test.c infer_dmabuf_test.h $KDIR/drivers/misc/
 grep -q infer_rc.o $KDIR/drivers/misc/Makefile || \
   echo 'obj-m += infer_rc.o' >> $KDIR/drivers/misc/Makefile
-make -C $KDIR M=drivers/misc infer_rc.ko
+grep -q infer_dmabuf_test.o $KDIR/drivers/misc/Makefile || \
+  echo 'obj-m += infer_dmabuf_test.o' >> $KDIR/drivers/misc/Makefile
+make -C $KDIR M=drivers/misc infer_rc.ko infer_dmabuf_test.ko
 
 # 用户态
 ${CROSS_COMPILE}gcc -O2 -Wall -o inferlat inferlat.c
@@ -54,24 +77,24 @@ ${CROSS_COMPILE}gcc -O2 -Wall -o inferpush inferpush.c
 ${CROSS_COMPILE}gcc -O2 -Wall -o inferzc inferzc.c
 ```
 
-`infer_dmabuf_test.ko` 由 `install-into-kernel.sh` 编进 `drivers/misc/`（给 `./inferzc ep` 提供 dma-buf fd）。
-
 ## 拷到板子
-
-拓扑对称：**A/B 两板都要** `pci_epf_infer.ko` + `infer_rc.ko` + `inferlat`。
 
 ```bash
 KDIR=~/workspace/linux-6.6
+SRC=/path/to/pcie-epf-infer-minlat
 for IP in <A_IP> <B_IP>; do
   ssh root@$IP 'mkdir -p /userdata/ep_test'
   scp $KDIR/drivers/pci/endpoint/functions/pci_epf_infer.ko \
-      $KDIR/drivers/misc/infer_rc.ko ./inferlat \
+      $KDIR/drivers/misc/infer_rc.ko \
+      $KDIR/drivers/misc/infer_dmabuf_test.ko \
+      $SRC/inferlat $SRC/inferpush $SRC/inferzc \
       root@$IP:/userdata/ep_test/
 done
 
 # 建议核对 md5，避免板子上还是旧 ko
 md5sum $KDIR/drivers/pci/endpoint/functions/pci_epf_infer.ko \
-       $KDIR/drivers/misc/infer_rc.ko
+       $KDIR/drivers/misc/infer_rc.ko \
+       $KDIR/drivers/misc/infer_dmabuf_test.ko
 ssh root@<A_IP> 'md5sum /userdata/ep_test/*.ko'
 ssh root@<B_IP> 'md5sum /userdata/ep_test/*.ko'
 ```
@@ -83,12 +106,14 @@ ssh root@<B_IP> 'md5sum /userdata/ep_test/*.ko'
 3. 确认两边 dmesg 都有 `ctrl BAR1 programmed` 和 `reprogram done magic=0x494e4652`
 4. **再**各自 remove/rescan 对端设备并 `insmod infer_rc.ko`
 5. `./inferlat /dev/infer_rc0 w 100` 与 `r 100`
+6. （可选）v2：`inferpush` / `inferzc`（见 `ZEROCOPY.md`）
 
 ### EP 侧
 
 ```bash
 insmod /userdata/ep_test/pci_epf_infer.ko
 ls /dev/pci_epf_infer_ctl
+ls /dev/pci_epf_infer0          # v2 收包节点
 
 cd /sys/kernel/config/pci_ep/
 mkdir -p functions/pci_epf_infer/func1
@@ -126,6 +151,20 @@ dmesg | grep infer_rc | tail -5
 
 ./inferlat /dev/infer_rc0 w 100
 ./inferlat /dev/infer_rc0 r 100
+# 期望: 4KB 中位 ~17µs，2MB ~6 GB/s
+```
+
+### v2 smoke（可选）
+
+```bash
+# 接收板
+./inferpush ep 0 4096
+# 或: insmod infer_dmabuf_test.ko && ./inferzc ep 0 4096
+
+# 发送板（60s 内）
+./inferpush rc 0 4096
+# 或: ./inferzc rc 0 4096
+# 或: insmod infer_dmabuf_test.ko && ./inferzc rc-dmabuf 0 4096
 ```
 
 ### 关于 `busybox devmem` 验 magic
@@ -148,3 +187,7 @@ dmesg | grep infer_rc | tail -5
 | Region 全是 `[disabled]` 且 Command 无 Memory | 等 `infer_rc` 的 `pcim_enable_device`（日志 `enabling device`） |
 | 成对重启后 BAR 尺寸异常 | 软 remove/rescan 不够；两板一起 reboot 再枚举 |
 | 板子 ko 行为像旧版 | md5 与开发机不一致；重新 scp |
+| `MAP_USER` → `Bad address` | 不要 mmap RC staging（`VM_PFNMAP`）；用匿名页或 `rc-dmabuf` |
+| dma-buf / MAP_* `-EINVAL` | 映射不是单连续 SG 段（`prep_slave_single` 限制） |
+| `inferpush` EP WAIT 超时 | RC 未在 60s 内 PUSH；先起 EP 再起 RC |
+| modpost `DMA_BUF` namespace | 模块缺 `MODULE_IMPORT_NS(DMA_BUF)` |

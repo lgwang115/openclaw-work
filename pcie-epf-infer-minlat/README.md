@@ -9,11 +9,11 @@
 | 缓冲区 | 每次传输分配 + CRC + 随机数 | 启动预分配 4MB，无 CRC；v2 可指定 ADDR/DMABUF |
 | 目标 | 功能验证 | 4KB 端到端目标 **20~40µs**（实测中位 **~17µs**） |
 
-协议见 `infer_proto.h`。设备 ID：`1ef1:0301`。
+协议见 `infer_proto.h` / `infer_proto_v2.h`。设备 ID：`1ef1:0301`。
 
 完整工作记录（设计动机、平台坑、编译部署、板测步骤、实测数据）见 **`BRINGUP.md`**。  
 编译与拷板细节见 **`BUILD.md`**。  
-零拷贝 NPU 互联（双缆单向推送、指定 NPU 地址）见 **`ZEROCOPY.md`** / `infer_proto_v2.h`（驱动已接线；真实 NPU runtime 待联调）。
+零拷贝 NPU 互联（双缆单向推送、指定 NPU 地址）见 **`ZEROCOPY.md`**（驱动已接线并板测；真实 NPU runtime 待联调）。
 
 ## BST BAR 布局（必读）
 
@@ -26,8 +26,8 @@
 
 ## 文件
 
-- `pci_epf_infer.c` — EP 侧（v1 staging + v2 POST_RECV/PUSH，`/dev/pci_epf_infer0`）
-- `infer_rc.c` — RC 侧（`XFER` + `PUSH`）
+- `pci_epf_infer.c` — EP 侧（v1 staging + v2 POST_RECV/PUSH，`/dev/pci_epf_infer_ctl` + `/dev/pci_epf_infer0`）
+- `infer_rc.c` — RC 侧（`XFER` + `PUSH` + `MAP_USER`/`MAP_DMABUF`）
 - `inferlat.c` — v1 延迟扫表
 - `inferpush.c` — v2 staging smoke（POST_RECV STAGING）
 - `inferzc.c` — v2 零拷贝接口测试（MAP_USER + DMABUF）
@@ -40,8 +40,9 @@
 
 ```bash
 ./install-into-kernel.sh /path/to/linux-6.6
-# 产物: pci_epf_infer.ko、infer_rc.ko、inferlat
-# 两板都要拷这三份（拓扑对称）
+# 产物: pci_epf_infer.ko、infer_rc.ko、infer_dmabuf_test.ko、
+#       inferlat、inferpush、inferzc
+# 两板都要拷全套（拓扑对称）
 ```
 
 详见 `BUILD.md`。
@@ -53,6 +54,7 @@
 ```bash
 insmod /userdata/ep_test/pci_epf_infer.ko
 ls /dev/pci_epf_infer_ctl   # 必须存在
+ls /dev/pci_epf_infer0      # v2 收包
 
 cd /sys/kernel/config/pci_ep/
 mkdir -p functions/pci_epf_infer/func1
@@ -90,12 +92,24 @@ ls /dev/infer_rc0
 
 > 不要在 `insmod infer_rc` 之前用 `devmem` 验 magic：设备未 enable Memory 时 BAR1 也常读到 `0xFFFFFFFF`。以 dmesg 为准。
 
-**测延迟：**
+**测延迟（v1）：**
 
 ```bash
 ./inferlat /dev/infer_rc0 w 100
 ./inferlat /dev/infer_rc0 r 100
 # 验收参考: 4KB 中位 ~17µs，2MB ~6 GB/s（见 BRINGUP.md）
+```
+
+**测零拷贝接口（v2，可选）：**
+
+```bash
+# 接收板
+./inferpush ep 0 4096
+# 或: insmod infer_dmabuf_test.ko && ./inferzc ep 0 4096
+
+# 发送板
+./inferpush rc 0 4096
+# 或: ./inferzc rc 0 4096 / ./inferzc rc-dmabuf 0 4096
 ```
 
 ## 关键路径时序
@@ -115,3 +129,4 @@ RC: poll BAR1 status until OK  → 返回耗时(ns)
 3. 双链路 EP2：每板各装 EP 模块 + 对面板装 RC 模块；数据面应按缆单向 WRITE 推送（见 `ZEROCOPY.md`）。
 4. 指定 NPU 地址：RC 可用 `PUSH` / `MAP_USER` / **`MAP_DMABUF`**；EP 可用 `POST_RECV(ADDR|DMABUF)`。
 5. `prep_slave_single`：MAP_* / EP DMABUF 要求单连续 DMA 段。
+6. 真实 NPU runtime 绑定仍为 P3（当前 smoke 用 staging 或 `infer_dmabuf_test`）。

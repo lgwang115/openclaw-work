@@ -1,15 +1,15 @@
 /*
- * inferpush.c — smoke test for v2 PUSH/ARM path (staging on EP)
+ * inferpush.c — smoke test for v2 PUSH/POST_RECV path (staging on EP)
  *
  * Build: ${CROSS_COMPILE}gcc -O2 -Wall -o inferpush inferpush.c
  *
  * On EP board (receiver):
  *   ./inferpush ep [slot] [size]
- * On RC board (sender), after EP is armed:
+ * On RC board (sender), after EP has posted recv:
  *   ./inferpush rc [slot] [size]
  *
  * EP uses INFER_EP_REG_F_STAGING (driver 4MB buffer) for this smoke test.
- * Replace with NPU local_dst later via ARM flags ADDR/DMABUF.
+ * Replace with NPU local_dst later via POST_RECV flags ADDR/DMABUF.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +24,7 @@
 
 static int do_ep(int slot, uint32_t size)
 {
-	struct infer_ep_recv_reg arm = {
+	struct infer_ep_recv_reg post = {
 		.slot = slot,
 		.flags = INFER_EP_REG_F_STAGING,
 		.capacity = size,
@@ -41,12 +41,12 @@ static int do_ep(int slot, uint32_t size)
 		return 1;
 	}
 
-	ret = ioctl(fd, INFER_EP_IOC_ARM, &arm);
+	ret = ioctl(fd, INFER_EP_IOC_POST_RECV, &post);
 	if (ret < 0) {
-		perror("ARM");
+		perror("POST_RECV");
 		return 1;
 	}
-	printf("EP ARM slot=%d staging size=%u — waiting for PUSH...\n",
+	printf("EP POST_RECV slot=%d staging size=%u — waiting for PUSH...\n",
 	       slot, size);
 
 	ret = ioctl(fd, INFER_EP_IOC_WAIT, &w);

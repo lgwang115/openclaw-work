@@ -6,7 +6,7 @@
  * via /dev/pci_epf_infer_ctl (BST start wipes bind-time BAR/ATU).
  *
  * v1: WRITE/READ against driver staging buffer (inferlat).
- * v2: PUSH → eDMA remote pci_addr → per-slot local_dst (ARM each packet).
+ * v2: PUSH → eDMA remote pci_addr → per-slot local_dst (POST_RECV each packet).
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -517,9 +517,9 @@ static struct miscdevice epf_ctl_misc = {
 	.fops	= &epf_ctl_fops,
 };
 
-/* ---- /dev/pci_epf_infer0 (ARM / WAIT) ---- */
+/* ---- /dev/pci_epf_infer0 (POST_RECV / WAIT) ---- */
 
-static int epf_arm_slot(struct epf_infer *ctx, struct infer_ep_recv_reg *reg)
+static int epf_post_recv_slot(struct epf_infer *ctx, struct infer_ep_recv_reg *reg)
 {
 	struct epf_infer_slot *slot;
 	unsigned long flags;
@@ -560,7 +560,7 @@ static int epf_arm_slot(struct epf_infer *ctx, struct infer_ep_recv_reg *reg)
 	epf_infer_update_credit_locked(ctx);
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
-	dev_dbg(&ctx->epf->dev, "ARM slot=%u dst=%pad cap=%zu staging=%d\n",
+	dev_dbg(&ctx->epf->dev, "POST_RECV slot=%u dst=%pad cap=%zu staging=%d\n",
 		reg->slot, &dst, cap, slot->use_staging);
 	return 0;
 }
@@ -631,10 +631,10 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 		return -ENODEV;
 
 	switch (cmd) {
-	case INFER_EP_IOC_ARM:
+	case INFER_EP_IOC_POST_RECV:
 		if (copy_from_user(&reg, uarg, sizeof(reg)))
 			return -EFAULT;
-		return epf_arm_slot(ctx, &reg);
+		return epf_post_recv_slot(ctx, &reg);
 
 	case INFER_EP_IOC_UNREG:
 		if (copy_from_user(&slot, uarg, sizeof(slot)))
@@ -828,5 +828,5 @@ static void __exit epf_infer_exit(void)
 }
 module_exit(epf_infer_exit);
 
-MODULE_DESCRIPTION("Min-latency PCIe EP (doorbell + PUSH/ARM zero-copy path)");
+MODULE_DESCRIPTION("Min-latency PCIe EP (doorbell + PUSH/POST_RECV zero-copy path)");
 MODULE_LICENSE("GPL");

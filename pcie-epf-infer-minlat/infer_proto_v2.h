@@ -3,7 +3,7 @@
  * infer_proto_v2.h — zero-copy NPU interconnect protocol
  *
  * Wired into pci_epf_infer / infer_rc (P1/P2):
- *   EP: ARM/WAIT + per-transfer local_dst for PUSH
+ *   EP: POST_RECV/WAIT + per-transfer local_dst for PUSH
  *   RC: INFER_IOC_PUSH with external pci_addr
  * v1 INFER_IOC_XFER (staging) remains for inferlat regression.
  *
@@ -49,7 +49,7 @@ struct infer_regs_v2 {
 	__u32 reserved_v2[4];
 } __attribute__((packed));
 
-#define INFER_EP_F_ZEROCOPY         (1u << 0)  /* ARM + PUSH supported */
+#define INFER_EP_F_ZEROCOPY         (1u << 0)  /* POST_RECV + PUSH supported */
 #define INFER_EP_F_DMABUF           (1u << 1)  /* EP accepts dma-buf fd */
 #define INFER_EP_F_MULTI_SLOT       (1u << 2)  /* INFER_V2_SLOTS > 1 */
 
@@ -107,8 +107,14 @@ struct infer_ep_recv_reg {
 #define INFER_EP_REG_F_DMABUF       (1u << 1)
 #define INFER_EP_REG_F_STAGING      (1u << 2)
 
-#define INFER_EP_IOC_ARM            _IOW(INFER_EP_IOC_MAGIC, 1, struct infer_ep_recv_reg)
-#define INFER_EP_IOC_REG_RECV       INFER_EP_IOC_ARM
+/*
+ * POST_RECV = provide this packet's local_dst and mark slot POSTED.
+ * Named to avoid confusion with the ARM CPU architecture.
+ */
+#define INFER_EP_IOC_POST_RECV      _IOW(INFER_EP_IOC_MAGIC, 1, struct infer_ep_recv_reg)
+#define INFER_EP_IOC_REG_RECV       INFER_EP_IOC_POST_RECV
+/* Deprecated alias (old name); same ioctl number. */
+#define INFER_EP_IOC_ARM            INFER_EP_IOC_POST_RECV
 #define INFER_EP_IOC_UNREG          _IOW(INFER_EP_IOC_MAGIC, 2, __u32)
 
 struct infer_ep_post {

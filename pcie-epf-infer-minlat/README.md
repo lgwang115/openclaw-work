@@ -26,10 +26,10 @@
 
 ## 文件
 
-- `pci_epf_infer.c` — EP 侧（v1 staging + v2 ARM/PUSH，`/dev/pci_epf_infer0`）
+- `pci_epf_infer.c` — EP 侧（v1 staging + v2 POST_RECV/PUSH，`/dev/pci_epf_infer0`）
 - `infer_rc.c` — RC 侧（`XFER` + `PUSH`）
 - `inferlat.c` — v1 延迟扫表
-- `inferpush.c` — v2 PUSH/ARM smoke
+- `inferpush.c` — v2 PUSH/POST_RECV smoke
 - `infer_proto.h` / `infer_proto_v2.h` — 协议
 - `install-into-kernel.sh` — 推荐编译入口
 - `ZEROCOPY.md` / `BRINGUP.md` / `BUILD.md` — 设计与板测
@@ -109,4 +109,4 @@ RC: poll BAR1 status until OK  → 返回耗时(ns)
 1. 成对重启纪律不变（BST EP 软复位恢复未修好前）。
 2. EP 侧 DMA 目前搬进 EP 本地 4MB；v1 无 EP 收包接口，不能直接当 rank send/recv。
 3. 双链路 EP2：每板各装 EP 模块 + 对面板装 RC 模块；数据面应按缆单向 WRITE 推送（见 `ZEROCOPY.md`）。
-4. 指定 NPU `pci_addr` / EP `local_dst`：v2 已接线（`PUSH`/`ARM`）；dma-buf 与 runtime 绑定见 `ZEROCOPY.md` P3/P4。
+4. 指定 NPU `pci_addr` / EP `local_dst`：v2 已接线（`PUSH`/`POST_RECV`）；dma-buf 与 runtime 绑定见 `ZEROCOPY.md` P3/P4。

@@ -681,6 +681,21 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 			return -EFAULT;
 		return ret;
 
+	case INFER_EP_IOC_GET_INFO: {
+		struct infer_ep_info info = {};
+
+		info.staging_size = ctx->buf_size;
+		info.staging_dma = ctx->buf_dma;
+		info.n_slots = INFER_V2_SLOTS;
+		if (ctx->regs)
+			info.ep_flags = READ_ONCE(ctx->regs->ep_flags);
+		else
+			info.ep_flags = INFER_EP_F_ZEROCOPY | INFER_EP_F_MULTI_SLOT;
+		if (copy_to_user(uarg, &info, sizeof(info)))
+			return -EFAULT;
+		return 0;
+	}
+
 	default:
 		return -ENOTTY;
 	}
@@ -695,10 +710,26 @@ static int epf_infer0_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static int epf_infer0_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct epf_infer *ctx = filp->private_data;
+	struct device *dma_dev;
+	unsigned long size = vma->vm_end - vma->vm_start;
+
+	if (!ctx || !ctx->buf || !ctx->epf || !ctx->epf->epc)
+		return -ENODEV;
+	if (size > ctx->buf_size)
+		return -EINVAL;
+
+	dma_dev = ctx->epf->epc->dev.parent;
+	return dma_mmap_coherent(dma_dev, vma, ctx->buf, ctx->buf_dma, size);
+}
+
 static const struct file_operations epf_infer0_fops = {
 	.owner		= THIS_MODULE,
 	.open		= epf_infer0_open,
 	.unlocked_ioctl	= epf_infer0_ioctl,
+	.mmap		= epf_infer0_mmap,
 };
 
 static int epf_infer_bind(struct pci_epf *epf)

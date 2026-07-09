@@ -135,4 +135,14 @@ struct infer_ep_wait {
 
 #define INFER_EP_IOC_WAIT           _IOWR(INFER_EP_IOC_MAGIC, 4, struct infer_ep_wait)
 
+/* Staging buffer info for mmap smoke tests (non-zero-copy). */
+struct infer_ep_info {
+	__u64 staging_size;
+	__u64 staging_dma;    /* local DMA addr; for debug only */
+	__u32 ep_flags;
+	__u32 n_slots;
+};
+
+#define INFER_EP_IOC_GET_INFO       _IOR(INFER_EP_IOC_MAGIC, 5, struct infer_ep_info)
+
 #endif /* _INFER_PROTO_V2_H_ */

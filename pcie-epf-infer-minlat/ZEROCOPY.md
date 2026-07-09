@@ -179,13 +179,12 @@ eDMA 编程点（实现时务必）：在门铃 work 里用 **本包** 的 `regs
 
 ```bash
 # 接收板（本板 EP）
-./inferpush ep 0 4096          # POST_RECV staging，阻塞 WAIT
-
-# 发送板（本板 RC → 对端 EP）
-./inferpush rc 0 4096          # PUSH 本端 staging dma_addr
+./inferpush ep 0 4096          # POST_RECV staging，阻塞 WAIT（最长 60s）
+# 发送板
+./inferpush rc 0 4096          # PUSH；EP 应打印 payload OK
 ```
 
-期望：EP 打印 `WAIT result=0 size=4096`；RC 打印 `PUSH result=0`。  
+期望：EP `WAIT result=0` 且 **`payload OK`**；RC `PUSH result=0`。  
 换 NPU 地址时：EP `POST_RECV` 用 `INFER_EP_REG_F_ADDR` + `local_dst`；RC `PUSH.pci_addr` 用已 `dma_map` 的 NPU_src。
 
 

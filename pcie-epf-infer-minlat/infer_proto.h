@@ -32,17 +32,19 @@ typedef int32_t  __s32;
 #define INFER_DEVICE_ID             0x0301
 
 /*
- * BAR0 must be large enough for this controller: doorbell lives at BAR0+0xe00,
- * and a 64KB BAR0 failed to enumerate on host (no Region 0). Match pci_epf_test
- * and use 1MB.
+ * On BST C1200/A2000 EP:
+ *   BAR0 = MSI-X table (offset 0) + doorbell (offset 0xe00) — hardware, NOT DDR
+ *   BAR1 = inbound-ATU-backed DDR window — put control registers here
+ * Putting magic at BAR0+0 always reads as 0/garbage from the host.
  */
-#define INFER_BAR0_SIZE             (1024 * 1024)
+#define INFER_CTRL_BARNO            1
+#define INFER_CTRL_BAR_SIZE         (1024 * 1024)
 #define INFER_MAX_XFER              (4 * 1024 * 1024)  /* 4MB prealloc slot */
 
 /*
- * BAR0 layout (control registers). All fields little-endian.
- * RC writes command fields then rings doorbell; EP clears command,
- * runs DMA, then writes status. RC polls status (no MSI on critical path).
+ * Control register block in BAR1. All fields little-endian.
+ * RC writes command fields then rings doorbell (BAR0+0xe00); EP clears
+ * command, runs DMA, then writes status. RC polls status.
  */
 struct infer_regs {
 	__u32 magic;
@@ -50,10 +52,10 @@ struct infer_regs {
 	__u32 status;
 	__u32 size;
 	__u64 pci_addr;       /* RC-side DMA address visible to EP */
-	__u32 db_bar;         /* filled by EP at bind: doorbell location */
+	__u32 db_bar;         /* filled by EP: doorbell location (usually 0) */
 	__u32 db_offset;
 	__u32 db_msg;
-	__u32 seq;            /* optional: RC increments each request */
+	__u32 seq;
 	__u32 reserved[4];
 } __attribute__((packed));
 

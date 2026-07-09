@@ -290,19 +290,21 @@ static int epf_infer_setup_doorbell(struct epf_infer *ctx)
 	return 0;
 }
 
-static int epf_infer_set_bar0(struct pci_epf *epf)
+static int epf_infer_set_ctrl_bar(struct pci_epf *epf)
 {
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
-	struct pci_epf_bar *epf_bar = &epf->bar[BAR_0];
+	enum pci_barno barno = INFER_CTRL_BARNO; /* BAR1: DDR via inbound ATU */
+	struct pci_epf_bar *epf_bar = &epf->bar[barno];
 	const struct pci_epc_features *features;
 	size_t align = PAGE_SIZE;
 	int ret;
 
 	/*
 	 * Allocate backing memory only once. pci_epf_alloc_space() fills
-	 * epf_bar (phys_addr/addr/size/barno), which must be preserved for
-	 * subsequent reinit calls — do NOT memset epf_bar on re-entry.
+	 * epf_bar (phys_addr/addr/size/barno). Do NOT memset epf_bar on re-entry.
+	 * BAR0 is reserved for MSI-X table + doorbell hardware — do not use it
+	 * for protocol registers (host reads of BAR0+0 see HW, not our DDR).
 	 */
 	if (!ctx->regs) {
 		void *base;
@@ -314,13 +316,14 @@ static int epf_infer_set_bar0(struct pci_epf *epf)
 		memset(epf_bar, 0, sizeof(*epf_bar));
 		epf_bar->flags = PCI_BASE_ADDRESS_SPACE_MEMORY |
 				 PCI_BASE_ADDRESS_MEM_TYPE_32;
-		epf_bar->barno = BAR_0;
-		epf_bar->size = INFER_BAR0_SIZE;
+		epf_bar->barno = barno;
+		epf_bar->size = INFER_CTRL_BAR_SIZE;
 
-		base = pci_epf_alloc_space(epf, INFER_BAR0_SIZE, BAR_0,
+		base = pci_epf_alloc_space(epf, INFER_CTRL_BAR_SIZE, barno,
 					   align, PRIMARY_INTERFACE);
 		if (!base) {
-			dev_err(&epf->dev, "pci_epf_alloc_space BAR0 failed\n");
+			dev_err(&epf->dev, "pci_epf_alloc_space BAR%d failed\n",
+				barno);
 			return -ENOMEM;
 		}
 		ctx->regs = base;
@@ -332,12 +335,13 @@ static int epf_infer_set_bar0(struct pci_epf *epf)
 
 	ret = pci_epc_set_bar(epc, epf->func_no, epf->vfunc_no, epf_bar);
 	if (ret) {
-		dev_err(&epf->dev, "pci_epc_set_bar BAR0 failed: %d\n", ret);
+		dev_err(&epf->dev, "pci_epc_set_bar BAR%d failed: %d\n",
+			barno, ret);
 		return ret;
 	}
 
-	dev_info(&epf->dev, "BAR0 programmed size=%llu phys=%pap\n",
-		 (unsigned long long)epf_bar->size, &epf_bar->phys_addr);
+	dev_info(&epf->dev, "ctrl BAR%d programmed size=%llu phys=%pap\n",
+		 barno, (unsigned long long)epf_bar->size, &epf_bar->phys_addr);
 	return 0;
 }
 
@@ -360,7 +364,7 @@ static int epf_infer_reprogram(struct pci_epf *epf)
 		return ret;
 	}
 
-	ret = epf_infer_set_bar0(epf);
+	ret = epf_infer_set_ctrl_bar(epf);
 	if (ret)
 		return ret;
 
@@ -476,8 +480,10 @@ static void epf_infer_unbind(struct pci_epf *epf)
 		ctx->db_irq = -1;
 	}
 	if (ctx->regs) {
-		pci_epc_clear_bar(epc, epf->func_no, epf->vfunc_no, &epf->bar[BAR_0]);
-		pci_epf_free_space(epf, ctx->regs, BAR_0, PRIMARY_INTERFACE);
+		pci_epc_clear_bar(epc, epf->func_no, epf->vfunc_no,
+				  &epf->bar[INFER_CTRL_BARNO]);
+		pci_epf_free_space(epf, ctx->regs, INFER_CTRL_BARNO,
+				   PRIMARY_INTERFACE);
 		ctx->regs = NULL;
 	}
 	epf_infer_cleanup_dma(ctx);

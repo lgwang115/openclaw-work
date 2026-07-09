@@ -186,3 +186,4 @@ module_exit(infer_dmabuf_exit);
 
 MODULE_DESCRIPTION("dma-buf exporter for pci_epf_infer POST_RECV tests");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(DMA_BUF);

@@ -1013,3 +1013,4 @@ module_exit(epf_infer_exit);
 
 MODULE_DESCRIPTION("Min-latency PCIe EP (doorbell + PUSH/POST_RECV zero-copy path)");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(DMA_BUF);

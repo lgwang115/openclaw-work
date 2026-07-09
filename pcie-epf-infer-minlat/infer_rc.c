@@ -701,3 +701,4 @@ static struct pci_driver infer_driver = {
 module_pci_driver(infer_driver);
 MODULE_DESCRIPTION("RC driver for pci_epf_infer (XFER/PUSH/MAP_USER/MAP_DMABUF)");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(DMA_BUF);

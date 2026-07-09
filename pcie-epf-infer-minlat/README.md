@@ -12,7 +12,8 @@
 协议见 `infer_proto.h`。设备 ID：`1ef1:0301`。
 
 完整工作记录（设计动机、平台坑、编译部署、板测步骤、实测数据）见 **`BRINGUP.md`**。  
-编译与拷板细节见 **`BUILD.md`**。
+编译与拷板细节见 **`BUILD.md`**。  
+零拷贝 NPU 互联（双缆单向推送、指定 NPU 地址）草案见 **`ZEROCOPY.md`** / `infer_proto_v2.h`（尚未接线到驱动）。
 
 ## BST BAR 布局（必读）
 
@@ -106,5 +107,6 @@ RC: poll BAR1 status until OK  → 返回耗时(ns)
 ## 已知限制
 
 1. 成对重启纪律不变（BST EP 软复位恢复未修好前）。
-2. EP 侧 DMA 目前搬进 EP 本地 4MB；真正推理要把缓冲映射到 NPU 可见内存。
-3. 双链路 EP2：每板各装 EP 模块 + 对面板装 RC 模块。
+2. EP 侧 DMA 目前搬进 EP 本地 4MB；v1 无 EP 收包接口，不能直接当 rank send/recv。
+3. 双链路 EP2：每板各装 EP 模块 + 对面板装 RC 模块；数据面应按缆单向 WRITE 推送（见 `ZEROCOPY.md`）。
+4. 指定 NPU `pci_addr` / EP `local_dst` 的零拷贝 ioctl 尚在草案阶段（`infer_proto_v2.h`）。

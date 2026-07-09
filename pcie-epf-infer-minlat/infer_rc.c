@@ -70,7 +70,10 @@ static int infer_do_xfer(struct infer_rc *rc, struct infer_xfer *x)
 	/* Clear completion, program command, then ring doorbell last. */
 	writel(INFER_STATUS_IDLE, &regs->status);
 	writel(x->size, &regs->size);
-	writeq(rc->buf_dma, &regs->pci_addr);
+	writel(lower_32_bits(rc->buf_dma),
+	       (void __iomem *)&regs->pci_addr);
+	writel(upper_32_bits(rc->buf_dma),
+	       (void __iomem *)&regs->pci_addr + 4);
 	wmb();
 	writel(x->cmd, &regs->command);
 	wmb();

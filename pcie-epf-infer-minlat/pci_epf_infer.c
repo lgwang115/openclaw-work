@@ -21,7 +21,13 @@
 #include <linux/pci_regs.h>
 
 #include "infer_proto.h"
-#include "bst_doorbell.h"
+/*
+ * Use the same BST header path as pci-epf-test.c when built in-tree:
+ *   drivers/pci/endpoint/functions/pci_epf_infer.c
+ * Out-of-tree builds should use install-into-kernel.sh (recommended),
+ * because bst_pcie_ep_db_* are typically not EXPORT_SYMBOL'd.
+ */
+#include "../../controller/bst/pcie-bst.h"
 
 #define DRV_NAME "pci_epf_infer"
 

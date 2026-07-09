@@ -6,6 +6,17 @@
 #ifndef _INFER_PROTO_H_
 #define _INFER_PROTO_H_
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+#include <linux/ioctl.h>
+#else
+#include <stdint.h>
+#include <sys/ioctl.h>
+typedef uint32_t __u32;
+typedef uint64_t __u64;
+typedef int32_t  __s32;
+#endif
+
 #define INFER_MAGIC                 0x494e4652u  /* 'INFR' */
 
 #define INFER_CMD_NONE              0

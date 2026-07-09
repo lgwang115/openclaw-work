@@ -176,13 +176,9 @@ static int infer_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct infer_rc *rc;
 	struct infer_regs __iomem *regs;
 	u32 magic;
-	int ret;
+	int ret, bar;
 
 	ret = pcim_enable_device(pdev);
-	if (ret)
-		return ret;
-
-	ret = pcim_iomap_regions(pdev, BIT(0), DRV_NAME);
 	if (ret)
 		return ret;
 
@@ -193,33 +189,58 @@ static int infer_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENOMEM;
 
 	rc->pdev = pdev;
-	rc->bar0 = pcim_iomap_table(pdev)[0];
-	rc->bar0_len = pci_resource_len(pdev, 0);
 	rc->buf_size = INFER_MAX_XFER;
 
-	regs = rc->bar0;
-	magic = readl(&regs->magic);
-	if (magic != INFER_MAGIC) {
-		dev_err(&pdev->dev, "bad magic 0x%x (want 0x%x)\n", magic, INFER_MAGIC);
-		return -ENODEV;
+	/* Scan BARs for control block (BAR0 preferred; must contain INFER_MAGIC). */
+	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+		if (!pci_resource_len(pdev, bar))
+			continue;
+		if (!(pci_resource_flags(pdev, bar) & IORESOURCE_MEM))
+			continue;
+
+		rc->bar0 = pci_iomap(pdev, bar, 0);
+		if (!rc->bar0) {
+			dev_warn(&pdev->dev, "pci_iomap BAR%d failed\n", bar);
+			continue;
+		}
+		rc->bar0_len = pci_resource_len(pdev, bar);
+		magic = readl(rc->bar0);
+		if (magic == INFER_MAGIC) {
+			dev_info(&pdev->dev, "infer regs on BAR%d len=%pa\n",
+				 bar, &rc->bar0_len);
+			break;
+		}
+		dev_warn(&pdev->dev, "BAR%d magic=0x%x want=0x%x\n",
+			 bar, magic, INFER_MAGIC);
+		pci_iounmap(pdev, rc->bar0);
+		rc->bar0 = NULL;
+	}
+	if (!rc->bar0) {
+		dev_err(&pdev->dev,
+			"no BAR with magic 0x%x (need EP pci_epf_infer + BAR0=1MB)\n",
+			INFER_MAGIC);
+		return -EINVAL;
 	}
 
+	regs = rc->bar0;
 	rc->db_bar = readl(&regs->db_bar);
 	rc->db_offset = readl(&regs->db_offset);
 	rc->db_msg = readl(&regs->db_msg);
-	if (rc->db_bar == 0 && rc->db_offset < rc->bar0_len)
+	if (rc->db_offset < rc->bar0_len)
 		rc->db_iomem = rc->bar0 + rc->db_offset;
 
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (ret)
 		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret)
-		return ret;
+		goto err_unmap;
 
 	rc->buf = dmam_alloc_coherent(&pdev->dev, rc->buf_size, &rc->buf_dma,
 				      GFP_KERNEL);
-	if (!rc->buf)
-		return -ENOMEM;
+	if (!rc->buf) {
+		ret = -ENOMEM;
+		goto err_unmap;
+	}
 
 	snprintf(rc->misc_name, sizeof(rc->misc_name), "infer_rc%d",
 		 pci_domain_nr(pdev->bus));
@@ -230,14 +251,18 @@ static int infer_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	ret = misc_register(&rc->misc);
 	if (ret)
-		return ret;
+		goto err_unmap;
 
 	pci_set_drvdata(pdev, rc);
 	dev_info(&pdev->dev,
-		 "infer_rc ready bar0=%p db=%u:0x%x msg=0x%x buf=%pad /dev/%s\n",
-		 rc->bar0, rc->db_bar, rc->db_offset, rc->db_msg, &rc->buf_dma,
+		 "infer_rc ready db=%u:0x%x msg=0x%x buf=%pad /dev/%s\n",
+		 rc->db_bar, rc->db_offset, rc->db_msg, &rc->buf_dma,
 		 rc->misc_name);
 	return 0;
+
+err_unmap:
+	pci_iounmap(pdev, rc->bar0);
+	return ret;
 }
 
 static void infer_remove(struct pci_dev *pdev)
@@ -245,6 +270,8 @@ static void infer_remove(struct pci_dev *pdev)
 	struct infer_rc *rc = pci_get_drvdata(pdev);
 
 	misc_deregister(&rc->misc);
+	if (rc->bar0)
+		pci_iounmap(pdev, rc->bar0);
 }
 
 static const struct pci_device_id infer_ids[] = {

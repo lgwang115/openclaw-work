@@ -31,7 +31,12 @@ typedef int32_t  __s32;
 #define INFER_VENDOR_ID             0x1ef1
 #define INFER_DEVICE_ID             0x0301
 
-#define INFER_BAR0_SIZE             (64 * 1024)
+/*
+ * BAR0 must be large enough for this controller: doorbell lives at BAR0+0xe00,
+ * and a 64KB BAR0 failed to enumerate on host (no Region 0). Match pci_epf_test
+ * and use 1MB.
+ */
+#define INFER_BAR0_SIZE             (1024 * 1024)
 #define INFER_MAX_XFER              (4 * 1024 * 1024)  /* 4MB prealloc slot */
 
 /*

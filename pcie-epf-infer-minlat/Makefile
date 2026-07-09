@@ -14,9 +14,9 @@ KDIR_ABS := $(abspath $(KDIR))
 
 ccflags-y += -I$(src)
 
-.PHONY: all modules clean inferlat check-version
+.PHONY: all modules clean inferlat inferpush check-version
 
-all: check-version modules inferlat
+all: check-version modules inferlat inferpush
 
 check-version:
 	@rel=$$(make -s -C $(KDIR_ABS) ARCH=$(ARCH) kernelrelease); \
@@ -32,6 +32,9 @@ modules:
 inferlat: inferlat.c infer_proto.h
 	$(CROSS_COMPILE)gcc -O2 -Wall -o inferlat inferlat.c
 
+inferpush: inferpush.c infer_proto.h infer_proto_v2.h
+	$(CROSS_COMPILE)gcc -O2 -Wall -o inferpush inferpush.c
+
 clean:
 	$(MAKE) -C $(KDIR_ABS) M=$(CURDIR) clean 2>/dev/null || true
-	rm -f inferlat
+	rm -f inferlat inferpush

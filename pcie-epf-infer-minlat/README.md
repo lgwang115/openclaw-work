@@ -26,13 +26,13 @@
 
 ## 文件
 
-- `pci_epf_infer.c` — EP 侧 function 驱动（进树编时 `#include ../../controller/bst/pcie-bst.h`）
-- `infer_rc.c` — RC 侧主机驱动
-- `inferlat.c` — 用户态延迟扫表（4KB→2MB）
-- `infer_proto.h` — 共享协议
-- `install-into-kernel.sh` — 推荐编译入口（拷进内核树再编）
-- `Makefile` — out-of-tree 备用（EP 通常链不上门铃符号，勿作主路径）
-- `BUILD.md` / `BRINGUP.md` — 编译部署与完整板测记录
+- `pci_epf_infer.c` — EP 侧（v1 staging + v2 ARM/PUSH，`/dev/pci_epf_infer0`）
+- `infer_rc.c` — RC 侧（`XFER` + `PUSH`）
+- `inferlat.c` — v1 延迟扫表
+- `inferpush.c` — v2 PUSH/ARM smoke
+- `infer_proto.h` / `infer_proto_v2.h` — 协议
+- `install-into-kernel.sh` — 推荐编译入口
+- `ZEROCOPY.md` / `BRINGUP.md` / `BUILD.md` — 设计与板测
 
 ## 编译
 
@@ -109,4 +109,4 @@ RC: poll BAR1 status until OK  → 返回耗时(ns)
 1. 成对重启纪律不变（BST EP 软复位恢复未修好前）。
 2. EP 侧 DMA 目前搬进 EP 本地 4MB；v1 无 EP 收包接口，不能直接当 rank send/recv。
 3. 双链路 EP2：每板各装 EP 模块 + 对面板装 RC 模块；数据面应按缆单向 WRITE 推送（见 `ZEROCOPY.md`）。
-4. 指定 NPU `pci_addr` / EP `local_dst` 的零拷贝 ioctl 尚在草案阶段（`infer_proto_v2.h`）。
+4. 指定 NPU `pci_addr` / EP `local_dst`：v2 已接线（`PUSH`/`ARM`）；dma-buf 与 runtime 绑定见 `ZEROCOPY.md` P3/P4。

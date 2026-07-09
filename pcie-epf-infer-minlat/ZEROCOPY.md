@@ -168,11 +168,26 @@ eDMA 编程点（实现时务必）：在门铃 work 里用 **本包** 的 `regs
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| P0 | 文档 + `infer_proto_v2.h`（本阶段） | 评审通过 |
-| P1 | EP：`ARM`/`WAIT`（先允许 staging 当地址源）+ 门铃里用 slot.local_dst | recv 通 |
-| P2 | RC：`PUSH` 接受外部 `pci_addr` | 发送端零拷贝 |
-| P3 | ARM 传入真实 NPU/dma-buf 地址；双 slot | 端到端每包换地址零拷贝 |
+| P0 | 文档 + `infer_proto_v2.h` | 评审通过 |
+| **P1/P2（已接线）** | EP：`/dev/pci_epf_infer0` ARM/WAIT；门铃 PUSH 用 `slot.local_dst`；RC：`INFER_IOC_PUSH` + `GET_CREDIT` | `inferpush` smoke；`inferlat` 仍可用 |
+| P3 | ARM 传入真实 NPU/dma-buf 地址；双 slot 流水 | 端到端每包换地址零拷贝 |
 | P4 | 推理 runtime 绑定 | 业务路径 |
+
+### 板测 v2 smoke（EP staging，验证通路）
+
+成对重启并完成 EP reprogram + RC `insmod` 后：
+
+```bash
+# 接收板（本板 EP）
+./inferpush ep 0 4096          # ARM staging，阻塞 WAIT
+
+# 发送板（本板 RC → 对端 EP）
+./inferpush rc 0 4096          # PUSH 本端 staging dma_addr
+```
+
+期望：EP 打印 `WAIT result=0 size=4096`；RC 打印 `PUSH result=0`。  
+换 NPU 地址时：EP `ARM` 用 `INFER_EP_REG_F_ADDR` + `local_dst`；RC `PUSH.pci_addr` 用已 `dma_map` 的 NPU_src。
+
 
 ## 11. 明确不做的事（本草案）
 

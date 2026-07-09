@@ -28,7 +28,7 @@ EP_DIR="$KDIR/drivers/pci/endpoint/functions"
 MISC_DIR="$KDIR/drivers/misc"
 
 echo "==> Install EP sources into $EP_DIR"
-cp -v "$SRC/pci_epf_infer.c" "$SRC/infer_proto.h" "$EP_DIR/"
+cp -v "$SRC/pci_epf_infer.c" "$SRC/infer_proto.h" "$SRC/infer_proto_v2.h" "$EP_DIR/"
 
 # In-tree build uses relative include of controller/bst/pcie-bst.h
 if ! grep -q 'pcie-bst.h' "$EP_DIR/pci_epf_infer.c"; then
@@ -42,7 +42,7 @@ if ! grep -q 'pci_epf_infer.o' "$EP_DIR/Makefile"; then
 fi
 
 echo "==> Install RC sources into $MISC_DIR"
-cp -v "$SRC/infer_rc.c" "$SRC/infer_proto.h" "$MISC_DIR/"
+cp -v "$SRC/infer_rc.c" "$SRC/infer_proto.h" "$SRC/infer_proto_v2.h" "$MISC_DIR/"
 if ! grep -q 'infer_rc.o' "$MISC_DIR/Makefile"; then
 	echo 'obj-m += infer_rc.o' >> "$MISC_DIR/Makefile"
 	echo "appended obj-m += infer_rc.o to $MISC_DIR/Makefile"
@@ -59,16 +59,19 @@ echo "==> Build RC module"
 make -C "$KDIR" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
 	M=drivers/misc infer_rc.ko
 
-echo "==> Build userspace tool"
+echo "==> Build userspace tools"
 "${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/inferlat" "$SRC/inferlat.c"
+"${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/inferpush" "$SRC/inferpush.c"
 
 echo
 echo "DONE. Artifacts:"
-ls -l "$EP_DIR/pci_epf_infer.ko" "$MISC_DIR/infer_rc.ko" "$SRC/inferlat"
+ls -l "$EP_DIR/pci_epf_infer.ko" "$MISC_DIR/infer_rc.ko" "$SRC/inferlat" "$SRC/inferpush"
 echo
-echo "Dual-board topology: copy ALL three artifacts to BOTH boards:"
+echo "Dual-board topology: copy ALL artifacts to BOTH boards:"
 echo "  for IP in <A_IP> <B_IP>; do"
-echo "    scp $EP_DIR/pci_epf_infer.ko $MISC_DIR/infer_rc.ko $SRC/inferlat \\"
-echo "        root@\$IP:/userdata/ep_test/"
+echo "    scp $EP_DIR/pci_epf_infer.ko $MISC_DIR/infer_rc.ko \\"
+echo "        $SRC/inferlat $SRC/inferpush root@\$IP:/userdata/ep_test/"
 echo "  done"
-echo "Then follow BRINGUP.md / BUILD.md (paired reboot → EP+ctl → RC → inferlat)."
+echo "v1 latency: ./inferlat /dev/infer_rc0 w 100"
+echo "v2 smoke:   EP: ./inferpush ep 0 4096   then RC: ./inferpush rc 0 4096"
+echo "See ZEROCOPY.md / BRINGUP.md."

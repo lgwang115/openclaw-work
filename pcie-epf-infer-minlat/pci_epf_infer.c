@@ -2,15 +2,11 @@
 /*
  * pci_epf_infer — minimum-latency PCIe EP function (A2000 / C1200)
  *
- * Critical: BAR/header/doorbell must be programmed in epc event .core_init,
- * NOT only in .bind. On this platform `echo 1 > start` re-inits the
- * controller; programming BARs in bind (before start) gets wiped, and the
- * host then only sees hardware-default BAR1/2/4 with no Region 0.
+ * Critical: BAR/header/doorbell must be programmed AFTER `echo 1 > start`
+ * via /dev/pci_epf_infer_ctl (BST start wipes bind-time BAR/ATU).
  *
- * Latency path vs pci_epf_test:
- *   doorbell IRQ -> immediate workqueue (NOT 1ms delayed_work)
- *   DMA with preallocated 4MB buffer
- *   completion = status register (RC polls; no MSI on critical path)
+ * v1: WRITE/READ against driver staging buffer (inferlat).
+ * v2: PUSH → eDMA remote pci_addr → per-slot local_dst (ARM each packet).
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -24,23 +20,33 @@
 #include <linux/pci-epc.h>
 #include <linux/pci-epf.h>
 #include <linux/pci_regs.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
 
-#include "infer_proto.h"
+#include "infer_proto_v2.h"
 #include "../../controller/bst/pcie-bst.h"
 
 #define DRV_NAME "pci_epf_infer"
 
+struct epf_infer_slot {
+	dma_addr_t		local_dst;
+	size_t			capacity;
+	u32			state;
+	u32			xfer_size;
+	u32			seq;
+	bool			use_staging;
+};
+
 struct epf_infer {
 	struct pci_epf		*epf;
-	struct infer_regs	*regs;
+	struct infer_regs_v2	*regs;
 	void			*buf;
 	dma_addr_t		buf_dma;
 	size_t			buf_size;
-	struct dma_chan		*dma_tx;	/* MEM_TO_DEV: EP -> RC */
-	struct dma_chan		*dma_rx;	/* DEV_TO_MEM: RC -> EP */
+	struct dma_chan		*dma_tx;
+	struct dma_chan		*dma_rx;
 	struct completion	xfer_done;
 	enum dma_status		xfer_status;
-	/* current in-flight transfer (single outstanding by design) */
 	struct dma_chan		*cur_chan;
 	dma_cookie_t		cur_cookie;
 	struct work_struct	cmd_work;
@@ -51,7 +57,30 @@ struct epf_infer {
 	spinlock_t		lock;
 	bool			busy;
 	bool			dma_ok;
+	struct epf_infer_slot	slots[INFER_V2_SLOTS];
+	wait_queue_head_t	slot_wq;
+	struct miscdevice	ep_misc;
+	bool			ep_misc_registered;
 };
+
+static struct epf_infer *g_epf_infer;
+
+static void epf_infer_update_credit_locked(struct epf_infer *ctx)
+{
+	u32 posted = 0, done = 0;
+	int i;
+
+	for (i = 0; i < INFER_V2_SLOTS; i++) {
+		if (ctx->slots[i].state == INFER_SLOT_POSTED)
+			posted |= BIT(i);
+		if (ctx->slots[i].state == INFER_SLOT_DONE)
+			done |= BIT(i);
+	}
+	if (ctx->regs) {
+		WRITE_ONCE(ctx->regs->posted_mask, posted);
+		WRITE_ONCE(ctx->regs->done_mask, done);
+	}
+}
 
 static void epf_infer_dma_cb(void *param)
 {
@@ -63,15 +92,13 @@ static void epf_infer_dma_cb(void *param)
 }
 
 /*
- * eDMA slave transfer, same as pci_epf_test private-DMA path:
- * remote PCI address goes into dma_slave_config (the eDMA engine on the
- * PCIe controller understands PCI bus addresses); local buffer is the
- * prep_slave_single address. Plain MEMCPY channels must NOT be used here:
- * a system DMA would treat the RC bus address as a local physical address.
+ * eDMA slave xfer: remote PCI addr in slave_config; local addr in prep.
+ * local_dma may be staging (ctx->buf_dma) or a per-packet NPU/DDR address.
  */
-static int epf_infer_dma_xfer(struct epf_infer *ctx,
-			      enum dma_transfer_direction dir,
-			      dma_addr_t remote, size_t size)
+static int epf_infer_dma_xfer_local(struct epf_infer *ctx,
+				    enum dma_transfer_direction dir,
+				    dma_addr_t remote, dma_addr_t local,
+				    size_t size)
 {
 	struct dma_chan *chan = (dir == DMA_DEV_TO_MEM) ? ctx->dma_rx : ctx->dma_tx;
 	struct dma_async_tx_descriptor *desc;
@@ -96,7 +123,7 @@ static int epf_infer_dma_xfer(struct epf_infer *ctx,
 	ctx->xfer_status = DMA_IN_PROGRESS;
 	ctx->cur_chan = chan;
 
-	desc = dmaengine_prep_slave_single(chan, ctx->buf_dma, size, dir,
+	desc = dmaengine_prep_slave_single(chan, local, size, dir,
 					   DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
 	if (!desc)
 		return -EIO;
@@ -111,7 +138,6 @@ static int epf_infer_dma_xfer(struct epf_infer *ctx,
 	dma_async_issue_pending(chan);
 
 	if (!wait_for_completion_timeout(&ctx->xfer_done, msecs_to_jiffies(100))) {
-		/* prevent a late callback touching a finished transfer */
 		dmaengine_terminate_sync(chan);
 		return -ETIMEDOUT;
 	}
@@ -120,12 +146,21 @@ static int epf_infer_dma_xfer(struct epf_infer *ctx,
 	return 0;
 }
 
+static int epf_infer_dma_xfer(struct epf_infer *ctx,
+			      enum dma_transfer_direction dir,
+			      dma_addr_t remote, size_t size)
+{
+	return epf_infer_dma_xfer_local(ctx, dir, remote, ctx->buf_dma, size);
+}
+
 static void epf_infer_cmd_work(struct work_struct *work)
 {
 	struct epf_infer *ctx = container_of(work, struct epf_infer, cmd_work);
-	struct infer_regs *regs = ctx->regs;
-	u32 cmd, size;
+	struct infer_regs_v2 *regs = ctx->regs;
+	struct epf_infer_slot *slot;
+	u32 cmd, size, slot_idx, seq;
 	u64 pci_addr;
+	dma_addr_t local;
 	int ret = 0;
 	unsigned long flags;
 
@@ -138,28 +173,70 @@ static void epf_infer_cmd_work(struct work_struct *work)
 
 	size = READ_ONCE(regs->size);
 	pci_addr = READ_ONCE(regs->pci_addr);
+	slot_idx = READ_ONCE(regs->slot);
 
 	WRITE_ONCE(regs->command, INFER_CMD_NONE);
 	WRITE_ONCE(regs->status, INFER_STATUS_BUSY);
 
-	if (!size || size > ctx->buf_size || !ctx->buf) {
-		ret = -EINVAL;
-		goto done;
-	}
-
 	switch (cmd) {
 	case INFER_CMD_WRITE:
-		ret = epf_infer_dma_xfer(ctx, DMA_DEV_TO_MEM, pci_addr, size);
-		break;
 	case INFER_CMD_READ:
-		ret = epf_infer_dma_xfer(ctx, DMA_MEM_TO_DEV, pci_addr, size);
+		if (!size || size > ctx->buf_size || !ctx->buf) {
+			ret = -EINVAL;
+			break;
+		}
+		if (cmd == INFER_CMD_WRITE)
+			ret = epf_infer_dma_xfer(ctx, DMA_DEV_TO_MEM, pci_addr, size);
+		else
+			ret = epf_infer_dma_xfer(ctx, DMA_MEM_TO_DEV, pci_addr, size);
 		break;
+
+	case INFER_CMD_PUSH:
+		if (slot_idx >= INFER_V2_SLOTS || !size) {
+			ret = -EINVAL;
+			break;
+		}
+		spin_lock_irqsave(&ctx->lock, flags);
+		slot = &ctx->slots[slot_idx];
+		if (slot->state != INFER_SLOT_POSTED) {
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			ret = -EINVAL;
+			break;
+		}
+		if (size > slot->capacity) {
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			ret = -EMSGSIZE;
+			break;
+		}
+		local = slot->local_dst;
+		slot->state = INFER_SLOT_BUSY;
+		epf_infer_update_credit_locked(ctx);
+		spin_unlock_irqrestore(&ctx->lock, flags);
+
+		ret = epf_infer_dma_xfer_local(ctx, DMA_DEV_TO_MEM, pci_addr,
+					       local, size);
+
+		spin_lock_irqsave(&ctx->lock, flags);
+		slot = &ctx->slots[slot_idx];
+		if (ret) {
+			slot->state = INFER_SLOT_ERROR;
+		} else {
+			seq = READ_ONCE(regs->seq) + 1;
+			WRITE_ONCE(regs->seq, seq);
+			slot->xfer_size = size;
+			slot->seq = seq;
+			slot->state = INFER_SLOT_DONE;
+		}
+		epf_infer_update_credit_locked(ctx);
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		wake_up_interruptible(&ctx->slot_wq);
+		break;
+
 	default:
 		ret = -EINVAL;
 		break;
 	}
 
-done:
 	wmb();
 	WRITE_ONCE(regs->status, ret ? INFER_STATUS_FAIL : INFER_STATUS_OK);
 out:
@@ -190,7 +267,6 @@ struct epf_dma_filter {
 	u32 dma_mask;
 };
 
-/* Pick eDMA channels that belong to the PCIe controller (pci_epf_test style) */
 static bool epf_infer_dma_filter(struct dma_chan *chan, void *arg)
 {
 	struct epf_dma_filter *filter = arg;
@@ -236,7 +312,7 @@ static int epf_infer_setup_dma(struct epf_infer *ctx)
 		return -ENOMEM;
 
 	ctx->dma_ok = true;
-	dev_info(&ctx->epf->dev, "DMA ready, buf %zu @ %pad\n",
+	dev_info(&ctx->epf->dev, "DMA ready, staging %zu @ %pad\n",
 		 ctx->buf_size, &ctx->buf_dma);
 	return 0;
 }
@@ -294,18 +370,12 @@ static int epf_infer_set_ctrl_bar(struct pci_epf *epf)
 {
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
-	enum pci_barno barno = INFER_CTRL_BARNO; /* BAR1: DDR via inbound ATU */
+	enum pci_barno barno = INFER_CTRL_BARNO;
 	struct pci_epf_bar *epf_bar = &epf->bar[barno];
 	const struct pci_epc_features *features;
 	size_t align = PAGE_SIZE;
 	int ret;
 
-	/*
-	 * Allocate backing memory only once. pci_epf_alloc_space() fills
-	 * epf_bar (phys_addr/addr/size/barno). Do NOT memset epf_bar on re-entry.
-	 * BAR0 is reserved for MSI-X table + doorbell hardware — do not use it
-	 * for protocol registers (host reads of BAR0+0 see HW, not our DDR).
-	 */
 	if (!ctx->regs) {
 		void *base;
 
@@ -332,6 +402,7 @@ static int epf_infer_set_ctrl_bar(struct pci_epf *epf)
 	memset(ctx->regs, 0, sizeof(*ctx->regs));
 	ctx->regs->magic = INFER_MAGIC;
 	ctx->regs->status = INFER_STATUS_IDLE;
+	ctx->regs->ep_flags = INFER_EP_F_ZEROCOPY | INFER_EP_F_MULTI_SLOT;
 
 	ret = pci_epc_set_bar(epc, epf->func_no, epf->vfunc_no, epf_bar);
 	if (ret) {
@@ -345,16 +416,11 @@ static int epf_infer_set_ctrl_bar(struct pci_epf *epf)
 	return 0;
 }
 
-/*
- * Force (re)program header + BAR + doorbell into the live controller.
- * Must run AFTER `echo 1 > .../start` on this BST platform: start wipes
- * BAR/ATU that were programmed during bind.
- */
 static int epf_infer_reprogram(struct pci_epf *epf)
 {
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
-	int ret;
+	int ret, i;
 
 	dev_info(&epf->dev, "reprogram: header/BAR/doorbell (post-start)\n");
 
@@ -382,21 +448,29 @@ static int epf_infer_reprogram(struct pci_epf *epf)
 		}
 	}
 
+	for (i = 0; i < INFER_V2_SLOTS; i++) {
+		ctx->slots[i].state = INFER_SLOT_EMPTY;
+		ctx->slots[i].local_dst = 0;
+		ctx->slots[i].capacity = 0;
+	}
+
 	WRITE_ONCE(ctx->regs->db_bar, ctx->db_bar);
 	WRITE_ONCE(ctx->regs->db_offset, ctx->db_offset);
 	WRITE_ONCE(ctx->regs->db_msg, ctx->db_msg);
 	WRITE_ONCE(ctx->regs->magic, INFER_MAGIC);
 	WRITE_ONCE(ctx->regs->status, INFER_STATUS_IDLE);
+	WRITE_ONCE(ctx->regs->ep_flags,
+		   INFER_EP_F_ZEROCOPY | INFER_EP_F_MULTI_SLOT);
+	epf_infer_update_credit_locked(ctx);
 	wmb();
 
-	dev_info(&epf->dev, "reprogram done magic=0x%x db=%u:0x%x\n",
+	dev_info(&epf->dev, "reprogram done magic=0x%x db=%u:0x%x v2\n",
 		 INFER_MAGIC, ctx->db_bar, ctx->db_offset);
 	return 0;
 }
 
 static int epf_infer_core_init(struct pci_epf *epf)
 {
-	/* If EPC ever calls this after start, treat as reprogram. */
 	return epf_infer_reprogram(epf);
 }
 
@@ -411,14 +485,8 @@ static const struct pci_epc_event_ops epf_infer_event_ops = {
 	.link_up	= epf_infer_link_up,
 };
 
-/* Global: only one function instance is supported for now. */
-static struct epf_infer *g_epf_infer;
+/* ---- /dev/pci_epf_infer_ctl (reprogram) ---- */
 
-/*
- * /dev/pci_epf_infer_ctl — write "1" AFTER controller start to reprogram
- * BAR/doorbell (BST start wipes BAR config done during bind).
- * Avoids hunting for pci-epf sysfs paths.
- */
 static ssize_t epf_ctl_write(struct file *filp, const char __user *ubuf,
 			     size_t count, loff_t *ppos)
 {
@@ -449,14 +517,194 @@ static struct miscdevice epf_ctl_misc = {
 	.fops	= &epf_ctl_fops,
 };
 
+/* ---- /dev/pci_epf_infer0 (ARM / WAIT) ---- */
+
+static int epf_arm_slot(struct epf_infer *ctx, struct infer_ep_recv_reg *reg)
+{
+	struct epf_infer_slot *slot;
+	unsigned long flags;
+	dma_addr_t dst;
+	size_t cap;
+
+	if (reg->slot >= INFER_V2_SLOTS)
+		return -EINVAL;
+
+	if (reg->flags & INFER_EP_REG_F_DMABUF)
+		return -EOPNOTSUPP;
+
+	if (reg->flags & INFER_EP_REG_F_STAGING) {
+		if (!ctx->buf)
+			return -ENODEV;
+		dst = ctx->buf_dma;
+		cap = ctx->buf_size;
+	} else if (reg->flags & INFER_EP_REG_F_ADDR) {
+		if (!reg->local_dst || !reg->capacity)
+			return -EINVAL;
+		dst = (dma_addr_t)reg->local_dst;
+		cap = (size_t)reg->capacity;
+	} else {
+		return -EINVAL;
+	}
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	slot = &ctx->slots[reg->slot];
+	if (slot->state == INFER_SLOT_BUSY) {
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		return -EBUSY;
+	}
+	slot->local_dst = dst;
+	slot->capacity = cap;
+	slot->use_staging = !!(reg->flags & INFER_EP_REG_F_STAGING);
+	slot->state = INFER_SLOT_POSTED;
+	slot->xfer_size = 0;
+	epf_infer_update_credit_locked(ctx);
+	spin_unlock_irqrestore(&ctx->lock, flags);
+
+	dev_dbg(&ctx->epf->dev, "ARM slot=%u dst=%pad cap=%zu staging=%d\n",
+		reg->slot, &dst, cap, slot->use_staging);
+	return 0;
+}
+
+static int epf_wait_slot(struct epf_infer *ctx, struct infer_ep_wait *w)
+{
+	struct epf_infer_slot *slot;
+	unsigned long flags;
+	long timeout;
+	u64 us = w->timeout_us ? w->timeout_us : 1000000ull;
+	int ret;
+
+	if (w->slot >= INFER_V2_SLOTS)
+		return -EINVAL;
+
+	timeout = wait_event_interruptible_timeout(
+		ctx->slot_wq,
+		({
+			u32 st;
+			spin_lock_irqsave(&ctx->lock, flags);
+			st = ctx->slots[w->slot].state;
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			st == INFER_SLOT_DONE || st == INFER_SLOT_ERROR;
+		}),
+		usecs_to_jiffies(us));
+
+	if (timeout < 0)
+		return timeout;
+	if (timeout == 0) {
+		w->result = -ETIMEDOUT;
+		return -ETIMEDOUT;
+	}
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	slot = &ctx->slots[w->slot];
+	if (slot->state == INFER_SLOT_ERROR) {
+		w->result = -EIO;
+		slot->state = INFER_SLOT_EMPTY;
+		ret = -EIO;
+	} else if (slot->state == INFER_SLOT_DONE) {
+		w->size = slot->xfer_size;
+		w->seq = slot->seq;
+		w->result = 0;
+		slot->state = INFER_SLOT_EMPTY;
+		ret = 0;
+	} else {
+		w->result = -EAGAIN;
+		ret = -EAGAIN;
+	}
+	epf_infer_update_credit_locked(ctx);
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	return ret;
+}
+
+static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
+			     unsigned long arg)
+{
+	struct epf_infer *ctx = filp->private_data;
+	void __user *uarg = (void __user *)arg;
+	struct infer_ep_recv_reg reg;
+	struct infer_ep_post post;
+	struct infer_ep_wait wait;
+	u32 slot;
+	unsigned long flags;
+	int ret;
+
+	if (!ctx)
+		return -ENODEV;
+
+	switch (cmd) {
+	case INFER_EP_IOC_ARM:
+		if (copy_from_user(&reg, uarg, sizeof(reg)))
+			return -EFAULT;
+		return epf_arm_slot(ctx, &reg);
+
+	case INFER_EP_IOC_UNREG:
+		if (copy_from_user(&slot, uarg, sizeof(slot)))
+			return -EFAULT;
+		if (slot >= INFER_V2_SLOTS)
+			return -EINVAL;
+		spin_lock_irqsave(&ctx->lock, flags);
+		if (ctx->slots[slot].state == INFER_SLOT_BUSY) {
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			return -EBUSY;
+		}
+		ctx->slots[slot].state = INFER_SLOT_EMPTY;
+		ctx->slots[slot].local_dst = 0;
+		ctx->slots[slot].capacity = 0;
+		epf_infer_update_credit_locked(ctx);
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		return 0;
+
+	case INFER_EP_IOC_POST:
+		if (copy_from_user(&post, uarg, sizeof(post)))
+			return -EFAULT;
+		if (post.slot >= INFER_V2_SLOTS)
+			return -EINVAL;
+		spin_lock_irqsave(&ctx->lock, flags);
+		if (!ctx->slots[post.slot].local_dst &&
+		    !ctx->slots[post.slot].use_staging) {
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			return -EINVAL;
+		}
+		if (ctx->slots[post.slot].state == INFER_SLOT_BUSY) {
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			return -EBUSY;
+		}
+		ctx->slots[post.slot].state = INFER_SLOT_POSTED;
+		epf_infer_update_credit_locked(ctx);
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		return 0;
+
+	case INFER_EP_IOC_WAIT:
+		if (copy_from_user(&wait, uarg, sizeof(wait)))
+			return -EFAULT;
+		ret = epf_wait_slot(ctx, &wait);
+		if (copy_to_user(uarg, &wait, sizeof(wait)))
+			return -EFAULT;
+		return ret;
+
+	default:
+		return -ENOTTY;
+	}
+}
+
+static int epf_infer0_open(struct inode *inode, struct file *filp)
+{
+	struct epf_infer *ctx =
+		container_of(filp->private_data, struct epf_infer, ep_misc);
+
+	filp->private_data = ctx;
+	return 0;
+}
+
+static const struct file_operations epf_infer0_fops = {
+	.owner		= THIS_MODULE,
+	.open		= epf_infer0_open,
+	.unlocked_ioctl	= epf_infer0_ioctl,
+};
+
 static int epf_infer_bind(struct pci_epf *epf)
 {
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 
-	/*
-	 * Do NOT program BARs in bind: BST `start` resets the controller and
-	 * wipes them. After start: echo 1 > /dev/pci_epf_infer_ctl
-	 */
 	epf->event_ops = &epf_infer_event_ops;
 	g_epf_infer = ctx;
 	dev_info(&epf->dev,
@@ -473,6 +721,11 @@ static void epf_infer_unbind(struct pci_epf *epf)
 		g_epf_infer = NULL;
 
 	cancel_work_sync(&ctx->cmd_work);
+
+	if (ctx->ep_misc_registered) {
+		misc_deregister(&ctx->ep_misc);
+		ctx->ep_misc_registered = false;
+	}
 
 	if (ctx->db_irq >= 0) {
 		bst_pcie_ep_db_irq_free(epc, epf->func_no, epf->vfunc_no,
@@ -501,6 +754,7 @@ static int epf_infer_probe(struct pci_epf *epf,
 			   const struct pci_epf_device_id *id)
 {
 	struct epf_infer *ctx;
+	int ret;
 
 	ctx = devm_kzalloc(&epf->dev, sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -510,12 +764,25 @@ static int epf_infer_probe(struct pci_epf *epf,
 	ctx->db_irq = -1;
 	spin_lock_init(&ctx->lock);
 	init_completion(&ctx->xfer_done);
+	init_waitqueue_head(&ctx->slot_wq);
 	INIT_WORK(&ctx->cmd_work, epf_infer_cmd_work);
 	epf->header = &epf_infer_header;
-	/* Register early so start/core_init can see it (pci_epf_test style). */
 	epf->event_ops = &epf_infer_event_ops;
 	epf_set_drvdata(epf, ctx);
-	dev_info(&epf->dev, "probe: event_ops ready\n");
+
+	ctx->ep_misc.minor = MISC_DYNAMIC_MINOR;
+	ctx->ep_misc.name = "pci_epf_infer0";
+	ctx->ep_misc.fops = &epf_infer0_fops;
+	ctx->ep_misc.parent = &epf->dev;
+	ret = misc_register(&ctx->ep_misc);
+	if (ret) {
+		dev_err(&epf->dev, "misc_register pci_epf_infer0 failed: %d\n",
+			ret);
+		return ret;
+	}
+	ctx->ep_misc_registered = true;
+
+	dev_info(&epf->dev, "probe: event_ops + /dev/pci_epf_infer0 ready\n");
 	return 0;
 }
 
@@ -561,5 +828,5 @@ static void __exit epf_infer_exit(void)
 }
 module_exit(epf_infer_exit);
 
-MODULE_DESCRIPTION("Min-latency PCIe EP function (doorbell + status poll)");
+MODULE_DESCRIPTION("Min-latency PCIe EP (doorbell + PUSH/ARM zero-copy path)");
 MODULE_LICENSE("GPL");

@@ -4,7 +4,9 @@
  *
  * Control registers live in BAR1 (DDR via inbound ATU).
  * Doorbell lives in BAR0 (hardware, typically offset 0xe00).
- * Critical path: write command regs -> ring doorbell -> poll status.
+ *
+ * v1: INFER_IOC_XFER uses driver staging buf_dma.
+ * v2: INFER_IOC_PUSH accepts per-transfer pci_addr (NPU/DDR bus addr).
  */
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -15,15 +17,15 @@
 #include <linux/delay.h>
 #include <linux/ktime.h>
 
-#include "infer_proto.h"
+#include "infer_proto_v2.h"
 
 #define DRV_NAME "infer_rc"
 
 struct infer_rc {
 	struct pci_dev		*pdev;
-	void __iomem		*ctrl;		/* BAR1: protocol regs */
+	void __iomem		*ctrl;		/* BAR1: infer_regs_v2 */
 	resource_size_t		ctrl_len;
-	void __iomem		*db_iomem;	/* BAR0+offset: doorbell */
+	void __iomem		*db_iomem;
 	void			*buf;
 	dma_addr_t		buf_dma;
 	size_t			buf_size;
@@ -41,12 +43,40 @@ static void infer_ring_doorbell(struct infer_rc *rc)
 		writel(rc->db_msg, rc->db_iomem);
 }
 
+static int infer_poll_status(struct infer_rc *rc, u64 timeout_ns, u64 *lat_ns)
+{
+	struct infer_regs_v2 __iomem *regs = rc->ctrl;
+	ktime_t t0, t1;
+	u32 st;
+
+	t0 = ktime_get();
+	infer_ring_doorbell(rc);
+
+	do {
+		st = readl(&regs->status);
+		if (st == INFER_STATUS_OK || st == INFER_STATUS_FAIL)
+			break;
+		cpu_relax();
+		t1 = ktime_get();
+	} while (ktime_to_ns(ktime_sub(t1, t0)) < timeout_ns);
+
+	t1 = ktime_get();
+	if (lat_ns)
+		*lat_ns = ktime_to_ns(ktime_sub(t1, t0));
+
+	if (st == INFER_STATUS_OK)
+		return 0;
+	if (st == INFER_STATUS_FAIL)
+		return -EIO;
+	return -ETIMEDOUT;
+}
+
 static int infer_do_xfer(struct infer_rc *rc, struct infer_xfer *x)
 {
-	struct infer_regs __iomem *regs = rc->ctrl;
-	ktime_t t0, t1;
+	struct infer_regs_v2 __iomem *regs = rc->ctrl;
 	u64 timeout_ns = x->timeout_us ? x->timeout_us * 1000ull : 100000000ull;
-	u32 st;
+	u64 lat;
+	int ret;
 
 	if (x->cmd != INFER_CMD_WRITE && x->cmd != INFER_CMD_READ)
 		return -EINVAL;
@@ -63,38 +93,50 @@ static int infer_do_xfer(struct infer_rc *rc, struct infer_xfer *x)
 	writel(x->cmd, &regs->command);
 	wmb();
 
-	t0 = ktime_get();
-	infer_ring_doorbell(rc);
+	ret = infer_poll_status(rc, timeout_ns, &lat);
+	x->timeout_us = lat;
+	x->result = ret;
+	return ret;
+}
 
-	do {
-		st = readl(&regs->status);
-		if (st == INFER_STATUS_OK || st == INFER_STATUS_FAIL)
-			break;
-		cpu_relax();
-		t1 = ktime_get();
-	} while (ktime_to_ns(ktime_sub(t1, t0)) < timeout_ns);
+static int infer_do_push(struct infer_rc *rc, struct infer_push *p)
+{
+	struct infer_regs_v2 __iomem *regs = rc->ctrl;
+	u64 timeout_ns = p->timeout_us ? p->timeout_us * 1000ull : 100000000ull;
+	u64 lat;
+	int ret;
 
-	t1 = ktime_get();
-	x->timeout_us = ktime_to_ns(ktime_sub(t1, t0));
+	if (p->slot >= INFER_V2_SLOTS)
+		return -EINVAL;
+	if (!p->size || !p->pci_addr)
+		return -EINVAL;
 
-	if (st == INFER_STATUS_OK) {
-		x->result = 0;
-		return 0;
-	}
-	if (st == INFER_STATUS_FAIL) {
-		x->result = -EIO;
-		return -EIO;
-	}
-	x->result = -ETIMEDOUT;
-	return -ETIMEDOUT;
+	writel(INFER_STATUS_IDLE, &regs->status);
+	writel(p->slot, &regs->slot);
+	writel(p->size, &regs->size);
+	writel(lower_32_bits(p->pci_addr),
+	       (void __iomem *)&regs->pci_addr);
+	writel(upper_32_bits(p->pci_addr),
+	       (void __iomem *)&regs->pci_addr + 4);
+	wmb();
+	writel(INFER_CMD_PUSH, &regs->command);
+	wmb();
+
+	ret = infer_poll_status(rc, timeout_ns, &lat);
+	p->timeout_us = lat;
+	p->result = ret;
+	return ret;
 }
 
 static long infer_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct infer_rc *rc = filp->private_data;
+	struct infer_regs_v2 __iomem *regs = rc->ctrl;
 	struct infer_db_info db;
 	struct infer_buf_req br;
 	struct infer_xfer x;
+	struct infer_push push;
+	struct infer_credit credit;
 	void __user *uarg = (void __user *)arg;
 
 	switch (cmd) {
@@ -123,6 +165,23 @@ static long infer_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (copy_to_user(uarg, &x, sizeof(x)))
 			return -EFAULT;
 		return x.result;
+
+	case INFER_IOC_PUSH:
+		if (copy_from_user(&push, uarg, sizeof(push)))
+			return -EFAULT;
+		infer_do_push(rc, &push);
+		if (copy_to_user(uarg, &push, sizeof(push)))
+			return -EFAULT;
+		return push.result;
+
+	case INFER_IOC_GET_CREDIT:
+		credit.posted_mask = readl(&regs->posted_mask);
+		credit.done_mask = readl(&regs->done_mask);
+		credit.seq = readl(&regs->seq);
+		credit.ep_flags = readl(&regs->ep_flags);
+		if (copy_to_user(uarg, &credit, sizeof(credit)))
+			return -EFAULT;
+		return 0;
 
 	default:
 		return -ENOTTY;
@@ -181,8 +240,8 @@ static int infer_map_doorbell(struct infer_rc *rc)
 static int infer_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct infer_rc *rc;
-	struct infer_regs __iomem *regs;
-	u32 magic;
+	struct infer_regs_v2 __iomem *regs;
+	u32 magic, ep_flags;
 	int ret, bar;
 
 	ret = pcim_enable_device(pdev);
@@ -199,7 +258,6 @@ static int infer_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	rc->buf_size = INFER_MAX_XFER;
 	rc->ctrl_bar = -1;
 
-	/* Prefer BAR1 (protocol); fall back to scanning all BARs for magic. */
 	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
 		int try = (bar == 0) ? INFER_CTRL_BARNO :
 			  (bar <= INFER_CTRL_BARNO ? bar - 1 : bar);
@@ -238,6 +296,7 @@ static int infer_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	rc->db_bar = readl(&regs->db_bar);
 	rc->db_offset = readl(&regs->db_offset);
 	rc->db_msg = readl(&regs->db_msg);
+	ep_flags = readl(&regs->ep_flags);
 
 	ret = infer_map_doorbell(rc);
 	if (ret) {
@@ -272,8 +331,8 @@ static int infer_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	pci_set_drvdata(pdev, rc);
 	dev_info(&pdev->dev,
-		 "infer_rc ready ctrl=BAR%d db=%u:0x%x msg=0x%x buf=%pad /dev/%s\n",
-		 rc->ctrl_bar, rc->db_bar, rc->db_offset, rc->db_msg, &rc->buf_dma,
+		 "infer_rc ready ctrl=BAR%d db=%u:0x%x ep_flags=0x%x buf=%pad /dev/%s\n",
+		 rc->ctrl_bar, rc->db_bar, rc->db_offset, ep_flags, &rc->buf_dma,
 		 rc->misc_name);
 	return 0;
 
@@ -310,5 +369,5 @@ static struct pci_driver infer_driver = {
 };
 
 module_pci_driver(infer_driver);
-MODULE_DESCRIPTION("RC driver for min-latency pci_epf_infer");
+MODULE_DESCRIPTION("RC driver for min-latency pci_epf_infer (XFER + PUSH)");
 MODULE_LICENSE("GPL");

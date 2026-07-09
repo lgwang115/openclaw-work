@@ -37,19 +37,20 @@ KDIR=~/workspace/linux-6.6
 export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
 
 # EP
-cp pci_epf_infer.c infer_proto.h $KDIR/drivers/pci/endpoint/functions/
+cp pci_epf_infer.c infer_proto.h infer_proto_v2.h $KDIR/drivers/pci/endpoint/functions/
 grep -q pci_epf_infer.o $KDIR/drivers/pci/endpoint/functions/Makefile || \
   echo 'obj-m += pci_epf_infer.o' >> $KDIR/drivers/pci/endpoint/functions/Makefile
 make -C $KDIR M=drivers/pci/endpoint/functions pci_epf_infer.ko
 
 # RC
-cp infer_rc.c infer_proto.h $KDIR/drivers/misc/
+cp infer_rc.c infer_proto.h infer_proto_v2.h $KDIR/drivers/misc/
 grep -q infer_rc.o $KDIR/drivers/misc/Makefile || \
   echo 'obj-m += infer_rc.o' >> $KDIR/drivers/misc/Makefile
 make -C $KDIR M=drivers/misc infer_rc.ko
 
-# 用户态（需能找到同目录的 infer_proto.h）
+# 用户态
 ${CROSS_COMPILE}gcc -O2 -Wall -o inferlat inferlat.c
+${CROSS_COMPILE}gcc -O2 -Wall -o inferpush inferpush.c
 ```
 
 ## 拷到板子

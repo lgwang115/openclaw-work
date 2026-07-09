@@ -260,7 +260,6 @@ static int epf_infer_set_bar0(struct pci_epf *epf)
 	struct pci_epf_bar *epf_bar = &epf->bar[BAR_0];
 	const struct pci_epc_features *features;
 	size_t align = PAGE_SIZE;
-	void *base;
 	int ret;
 
 	features = pci_epc_get_features(epc, epf->func_no, epf->vfunc_no);
@@ -273,14 +272,16 @@ static int epf_infer_set_bar0(struct pci_epf *epf)
 	epf_bar->barno = BAR_0;
 	epf_bar->size = INFER_BAR0_SIZE;
 
-	base = pci_epf_alloc_space(epf, INFER_BAR0_SIZE, BAR_0, align,
-				   PRIMARY_INTERFACE);
-	if (!base) {
-		dev_err(&epf->dev, "pci_epf_alloc_space BAR0 failed\n");
-		return -ENOMEM;
+	if (!ctx->regs) {
+		void *base = pci_epf_alloc_space(epf, INFER_BAR0_SIZE, BAR_0,
+						 align, PRIMARY_INTERFACE);
+		if (!base) {
+			dev_err(&epf->dev, "pci_epf_alloc_space BAR0 failed\n");
+			return -ENOMEM;
+		}
+		ctx->regs = base;
 	}
 
-	ctx->regs = base;
 	memset(ctx->regs, 0, sizeof(*ctx->regs));
 	ctx->regs->magic = INFER_MAGIC;
 	ctx->regs->status = INFER_STATUS_IDLE;
@@ -288,8 +289,6 @@ static int epf_infer_set_bar0(struct pci_epf *epf)
 	ret = pci_epc_set_bar(epc, epf->func_no, epf->vfunc_no, epf_bar);
 	if (ret) {
 		dev_err(&epf->dev, "pci_epc_set_bar BAR0 failed: %d\n", ret);
-		pci_epf_free_space(epf, base, BAR_0, PRIMARY_INTERFACE);
-		ctx->regs = NULL;
 		return ret;
 	}
 
@@ -299,27 +298,17 @@ static int epf_infer_set_bar0(struct pci_epf *epf)
 }
 
 /*
- * Called by EPC when controller is ready (after start) — same timing as
- * pci_epf_test_core_init. This is the correct place to program BARs.
+ * Force (re)program header + BAR + doorbell into the live controller.
+ * Must run AFTER `echo 1 > .../start` on this BST platform: start wipes
+ * BAR/ATU that were programmed during bind.
  */
-static int epf_infer_core_init(struct pci_epf *epf)
+static int epf_infer_reprogram(struct pci_epf *epf)
 {
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
 	int ret;
 
-	/* Idempotent: safe if called from core_init and again from link_up */
-	if (ctx->regs) {
-		dev_info(&epf->dev, "core_init: already done, refresh magic/db\n");
-		WRITE_ONCE(ctx->regs->magic, INFER_MAGIC);
-		WRITE_ONCE(ctx->regs->db_bar, ctx->db_bar);
-		WRITE_ONCE(ctx->regs->db_offset, ctx->db_offset);
-		WRITE_ONCE(ctx->regs->db_msg, ctx->db_msg);
-		WRITE_ONCE(ctx->regs->status, INFER_STATUS_IDLE);
-		return 0;
-	}
-
-	dev_info(&epf->dev, "core_init: programming header/BAR/doorbell\n");
+	dev_info(&epf->dev, "reprogram: header/BAR/doorbell (post-start)\n");
 
 	ret = pci_epc_write_header(epc, epf->func_no, epf->vfunc_no, epf->header);
 	if (ret) {
@@ -350,25 +339,23 @@ static int epf_infer_core_init(struct pci_epf *epf)
 	WRITE_ONCE(ctx->regs->db_msg, ctx->db_msg);
 	WRITE_ONCE(ctx->regs->magic, INFER_MAGIC);
 	WRITE_ONCE(ctx->regs->status, INFER_STATUS_IDLE);
+	wmb();
 
-	dev_info(&epf->dev, "core_init done magic=0x%x db=%u:0x%x\n",
+	dev_info(&epf->dev, "reprogram done magic=0x%x db=%u:0x%x\n",
 		 INFER_MAGIC, ctx->db_bar, ctx->db_offset);
 	return 0;
 }
 
+static int epf_infer_core_init(struct pci_epf *epf)
+{
+	/* If EPC ever calls this after start, treat as reprogram. */
+	return epf_infer_reprogram(epf);
+}
+
 static int epf_infer_link_up(struct pci_epf *epf)
 {
-	struct epf_infer *ctx = epf_get_drvdata(epf);
-
-	dev_info(&epf->dev, "link_up\n");
-	/*
-	 * BST may not invoke event_ops->core_init on start. Fall back here
-	 * so BARs are programmed after the controller is live (same window
-	 * where pci_epf_test historically ran set_bar).
-	 */
-	if (!ctx->regs)
-		return epf_infer_core_init(epf);
-	return 0;
+	dev_info(&epf->dev, "link_up -> reprogram\n");
+	return epf_infer_reprogram(epf);
 }
 
 static const struct pci_epc_event_ops epf_infer_event_ops = {
@@ -376,14 +363,35 @@ static const struct pci_epc_event_ops epf_infer_event_ops = {
 	.link_up	= epf_infer_link_up,
 };
 
+/* echo 1 > .../functions/pci_epf_infer/func1/reinit  AFTER start */
+static ssize_t reinit_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct pci_epf *epf = to_pci_epf(dev);
+	int ret;
+
+	ret = epf_infer_reprogram(epf);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(reinit);
+
 static int epf_infer_bind(struct pci_epf *epf)
 {
+	int ret;
+
 	/*
-	 * event_ops already set in probe. If core_init still does not fire
-	 * on this BSP, try programming now; link_up will retry if wiped.
+	 * Do NOT program BARs in bind: BST `start` resets the controller and
+	 * wipes them. User must: start -> echo 1 > reinit -> RC rescan.
 	 */
-	dev_info(&epf->dev, "bind\n");
-	return epf_infer_core_init(epf);
+	epf->event_ops = &epf_infer_event_ops;
+	ret = device_create_file(&epf->dev, &dev_attr_reinit);
+	if (ret)
+		dev_warn(&epf->dev, "reinit sysfs create failed: %d\n", ret);
+
+	dev_info(&epf->dev,
+		 "bind ok; AFTER start run: echo 1 > %s/reinit\n",
+		 dev_name(&epf->dev));
+	return 0;
 }
 
 static void epf_infer_unbind(struct pci_epf *epf)
@@ -391,6 +399,7 @@ static void epf_infer_unbind(struct pci_epf *epf)
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
 
+	device_remove_file(&epf->dev, &dev_attr_reinit);
 	cancel_work_sync(&ctx->cmd_work);
 
 	if (ctx->db_irq >= 0) {
@@ -404,6 +413,7 @@ static void epf_infer_unbind(struct pci_epf *epf)
 		ctx->regs = NULL;
 	}
 	epf_infer_cleanup_dma(ctx);
+	epf->event_ops = NULL;
 }
 
 static struct pci_epf_header epf_infer_header = {

@@ -7,14 +7,15 @@
  *
  * v1: WRITE/READ against driver staging buffer (inferlat).
  * v2: PUSH → eDMA remote pci_addr → per-slot local_dst (POST_RECV each packet).
+ *
+ * Latency path: doorbell IRQ submits eDMA immediately (no workqueue),
+ * DMA callback writes status. Single-outstanding via ctx->busy.
  */
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-buf.h>
-#include <linux/completion.h>
-#include <linux/workqueue.h>
 #include <linux/io.h>
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
@@ -51,11 +52,8 @@ struct epf_infer {
 	size_t			buf_size;
 	struct dma_chan		*dma_tx;
 	struct dma_chan		*dma_rx;
-	struct completion	xfer_done;
-	enum dma_status		xfer_status;
 	struct dma_chan		*cur_chan;
 	dma_cookie_t		cur_cookie;
-	struct work_struct	cmd_work;
 	int			db_irq;
 	u32			db_bar;
 	u32			db_offset;
@@ -63,6 +61,10 @@ struct epf_infer {
 	spinlock_t		lock;
 	bool			busy;
 	bool			dma_ok;
+	/* in-flight command context (valid while busy) */
+	u32			pend_cmd;
+	u32			pend_slot;
+	u32			pend_size;
 	struct epf_infer_slot	slots[INFER_V2_SLOTS];
 	wait_queue_head_t	slot_wq;
 	struct miscdevice	ep_misc;
@@ -104,23 +106,16 @@ static void epf_infer_update_credit_locked(struct epf_infer *ctx)
 	}
 }
 
-static void epf_infer_dma_cb(void *param)
-{
-	struct epf_infer *ctx = param;
-
-	ctx->xfer_status = dma_async_is_tx_complete(ctx->cur_chan,
-						    ctx->cur_cookie, NULL, NULL);
-	complete(&ctx->xfer_done);
-}
+static void epf_infer_dma_cb(void *param);
 
 /*
- * eDMA slave xfer: remote PCI addr in slave_config; local addr in prep.
- * local_dma may be staging (ctx->buf_dma) or a per-packet NPU/DDR address.
+ * Submit eDMA only (no wait). Safe from doorbell IRQ.
+ * Completion is handled in epf_infer_dma_cb.
  */
-static int epf_infer_dma_xfer_local(struct epf_infer *ctx,
-				    enum dma_transfer_direction dir,
-				    dma_addr_t remote, dma_addr_t local,
-				    size_t size)
+static int epf_infer_dma_submit(struct epf_infer *ctx,
+				enum dma_transfer_direction dir,
+				dma_addr_t remote, dma_addr_t local,
+				size_t size)
 {
 	struct dma_chan *chan = (dir == DMA_DEV_TO_MEM) ? ctx->dma_rx : ctx->dma_tx;
 	struct dma_async_tx_descriptor *desc;
@@ -141,10 +136,7 @@ static int epf_infer_dma_xfer_local(struct epf_infer *ctx,
 	if (ret)
 		return ret;
 
-	reinit_completion(&ctx->xfer_done);
-	ctx->xfer_status = DMA_IN_PROGRESS;
 	ctx->cur_chan = chan;
-
 	desc = dmaengine_prep_slave_single(chan, local, size, dir,
 					   DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
 	if (!desc)
@@ -158,40 +150,86 @@ static int epf_infer_dma_xfer_local(struct epf_infer *ctx,
 		return -EIO;
 	ctx->cur_cookie = cookie;
 	dma_async_issue_pending(chan);
-
-	if (!wait_for_completion_timeout(&ctx->xfer_done, msecs_to_jiffies(100))) {
-		dmaengine_terminate_sync(chan);
-		return -ETIMEDOUT;
-	}
-	if (ctx->xfer_status != DMA_COMPLETE)
-		return -EIO;
 	return 0;
 }
 
-static int epf_infer_dma_xfer(struct epf_infer *ctx,
-			      enum dma_transfer_direction dir,
-			      dma_addr_t remote, size_t size)
+static void epf_infer_finish_locked(struct epf_infer *ctx, int ret)
 {
-	return epf_infer_dma_xfer_local(ctx, dir, remote, ctx->buf_dma, size);
-}
-
-static void epf_infer_cmd_work(struct work_struct *work)
-{
-	struct epf_infer *ctx = container_of(work, struct epf_infer, cmd_work);
 	struct infer_regs_v2 *regs = ctx->regs;
 	struct epf_infer_slot *slot;
-	u32 cmd, size, slot_idx, seq;
+	u32 seq;
+
+	if (ctx->pend_cmd == INFER_CMD_PUSH &&
+	    ctx->pend_slot < INFER_V2_SLOTS) {
+		slot = &ctx->slots[ctx->pend_slot];
+		if (ret) {
+			slot->state = INFER_SLOT_ERROR;
+		} else {
+			seq = READ_ONCE(regs->seq) + 1;
+			WRITE_ONCE(regs->seq, seq);
+			slot->xfer_size = ctx->pend_size;
+			slot->seq = seq;
+			slot->state = INFER_SLOT_DONE;
+		}
+		epf_infer_update_credit_locked(ctx);
+	}
+
+	wmb();
+	if (regs)
+		WRITE_ONCE(regs->status, ret ? INFER_STATUS_FAIL : INFER_STATUS_OK);
+
+	ctx->pend_cmd = INFER_CMD_NONE;
+	ctx->busy = false;
+}
+
+static void epf_infer_dma_cb(void *param)
+{
+	struct epf_infer *ctx = param;
+	enum dma_status st;
+	unsigned long flags;
+	int ret = 0;
+
+	st = dma_async_is_tx_complete(ctx->cur_chan, ctx->cur_cookie, NULL, NULL);
+	if (st != DMA_COMPLETE)
+		ret = -EIO;
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	epf_infer_finish_locked(ctx, ret);
+	spin_unlock_irqrestore(&ctx->lock, flags);
+
+	wake_up_interruptible(&ctx->slot_wq);
+}
+
+/*
+ * Doorbell IRQ: single-outstanding kick. Parse command and submit eDMA
+ * immediately — no workqueue scheduling on the critical path.
+ */
+static int epf_infer_doorbell_handler(int irq, void *arg)
+{
+	struct epf_infer *ctx = arg;
+	struct infer_regs_v2 *regs = ctx->regs;
+	struct epf_infer_slot *slot;
+	unsigned long flags;
+	u32 cmd, size, slot_idx;
 	u64 pci_addr;
 	dma_addr_t local;
-	int ret = 0;
-	unsigned long flags;
+	enum dma_transfer_direction dir;
+	int ret;
 
 	if (!regs)
-		goto out;
+		return IRQ_HANDLED;
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	if (ctx->busy) {
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		return IRQ_HANDLED;
+	}
 
 	cmd = READ_ONCE(regs->command);
-	if (!cmd)
-		goto out;
+	if (!cmd) {
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		return IRQ_HANDLED;
+	}
 
 	size = READ_ONCE(regs->size);
 	pci_addr = READ_ONCE(regs->pci_addr);
@@ -200,87 +238,69 @@ static void epf_infer_cmd_work(struct work_struct *work)
 	WRITE_ONCE(regs->command, INFER_CMD_NONE);
 	WRITE_ONCE(regs->status, INFER_STATUS_BUSY);
 
+	ctx->busy = true;
+	ctx->pend_cmd = cmd;
+	ctx->pend_slot = slot_idx;
+	ctx->pend_size = size;
+
 	switch (cmd) {
 	case INFER_CMD_WRITE:
+		if (!size || size > ctx->buf_size || !ctx->buf) {
+			epf_infer_finish_locked(ctx, -EINVAL);
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			return IRQ_HANDLED;
+		}
+		local = ctx->buf_dma;
+		dir = DMA_DEV_TO_MEM;
+		break;
+
 	case INFER_CMD_READ:
 		if (!size || size > ctx->buf_size || !ctx->buf) {
-			ret = -EINVAL;
-			break;
+			epf_infer_finish_locked(ctx, -EINVAL);
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			return IRQ_HANDLED;
 		}
-		if (cmd == INFER_CMD_WRITE)
-			ret = epf_infer_dma_xfer(ctx, DMA_DEV_TO_MEM, pci_addr, size);
-		else
-			ret = epf_infer_dma_xfer(ctx, DMA_MEM_TO_DEV, pci_addr, size);
+		local = ctx->buf_dma;
+		dir = DMA_MEM_TO_DEV;
 		break;
 
 	case INFER_CMD_PUSH:
 		if (slot_idx >= INFER_V2_SLOTS || !size) {
-			ret = -EINVAL;
-			break;
+			epf_infer_finish_locked(ctx, -EINVAL);
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			return IRQ_HANDLED;
 		}
-		spin_lock_irqsave(&ctx->lock, flags);
 		slot = &ctx->slots[slot_idx];
 		if (slot->state != INFER_SLOT_POSTED) {
+			epf_infer_finish_locked(ctx, -EINVAL);
 			spin_unlock_irqrestore(&ctx->lock, flags);
-			ret = -EINVAL;
-			break;
+			return IRQ_HANDLED;
 		}
 		if (size > slot->capacity) {
+			epf_infer_finish_locked(ctx, -EMSGSIZE);
 			spin_unlock_irqrestore(&ctx->lock, flags);
-			ret = -EMSGSIZE;
-			break;
+			return IRQ_HANDLED;
 		}
 		local = slot->local_dst;
 		slot->state = INFER_SLOT_BUSY;
 		epf_infer_update_credit_locked(ctx);
-		spin_unlock_irqrestore(&ctx->lock, flags);
-
-		ret = epf_infer_dma_xfer_local(ctx, DMA_DEV_TO_MEM, pci_addr,
-					       local, size);
-
-		spin_lock_irqsave(&ctx->lock, flags);
-		slot = &ctx->slots[slot_idx];
-		if (ret) {
-			slot->state = INFER_SLOT_ERROR;
-		} else {
-			seq = READ_ONCE(regs->seq) + 1;
-			WRITE_ONCE(regs->seq, seq);
-			slot->xfer_size = size;
-			slot->seq = seq;
-			slot->state = INFER_SLOT_DONE;
-		}
-		epf_infer_update_credit_locked(ctx);
-		spin_unlock_irqrestore(&ctx->lock, flags);
-		wake_up_interruptible(&ctx->slot_wq);
+		dir = DMA_DEV_TO_MEM;
 		break;
 
 	default:
-		ret = -EINVAL;
-		break;
-	}
-
-	wmb();
-	WRITE_ONCE(regs->status, ret ? INFER_STATUS_FAIL : INFER_STATUS_OK);
-out:
-	spin_lock_irqsave(&ctx->lock, flags);
-	ctx->busy = false;
-	spin_unlock_irqrestore(&ctx->lock, flags);
-}
-
-static int epf_infer_doorbell_handler(int irq, void *arg)
-{
-	struct epf_infer *ctx = arg;
-	unsigned long flags;
-
-	spin_lock_irqsave(&ctx->lock, flags);
-	if (ctx->busy) {
+		epf_infer_finish_locked(ctx, -EINVAL);
 		spin_unlock_irqrestore(&ctx->lock, flags);
 		return IRQ_HANDLED;
 	}
-	ctx->busy = true;
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
-	queue_work(system_highpri_wq, &ctx->cmd_work);
+	ret = epf_infer_dma_submit(ctx, dir, pci_addr, local, size);
+	if (ret) {
+		spin_lock_irqsave(&ctx->lock, flags);
+		epf_infer_finish_locked(ctx, ret);
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		wake_up_interruptible(&ctx->slot_wq);
+	}
 	return IRQ_HANDLED;
 }
 
@@ -900,7 +920,9 @@ static void epf_infer_unbind(struct pci_epf *epf)
 	if (g_epf_infer == ctx)
 		g_epf_infer = NULL;
 
-	cancel_work_sync(&ctx->cmd_work);
+	/* Drain any in-flight DMA before tearing down. */
+	if (ctx->cur_chan && ctx->busy)
+		dmaengine_terminate_sync(ctx->cur_chan);
 
 	for (i = 0; i < INFER_V2_SLOTS; i++)
 		epf_slot_release_dmabuf(&ctx->slots[i]);
@@ -946,9 +968,7 @@ static int epf_infer_probe(struct pci_epf *epf,
 	ctx->epf = epf;
 	ctx->db_irq = -1;
 	spin_lock_init(&ctx->lock);
-	init_completion(&ctx->xfer_done);
 	init_waitqueue_head(&ctx->slot_wq);
-	INIT_WORK(&ctx->cmd_work, epf_infer_cmd_work);
 	epf->header = &epf_infer_header;
 	epf->event_ops = &epf_infer_event_ops;
 	epf_set_drvdata(epf, ctx);

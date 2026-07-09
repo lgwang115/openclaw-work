@@ -97,5 +97,7 @@ ls /dev/infer_rc0
 | --- | --- |
 | `Unknown symbol bst_pcie_ep_db_*` | 用了纯 out-of-tree；改用 `install-into-kernel.sh` |
 | `disagrees about version of symbol` | `kernelrelease` 不是 `6.6.64-rt47` |
+| `Module.symvers is missing` / `__pci_register_driver` undefined | 源码树没编过内核，缺符号表。从板子拷：`scp root@板子:/lib/modules/$(uname -r)/build/Module.symvers $KDIR/`（或 `/usr/src/linux-headers-.../Module.symvers`） |
+| `probe` 指针类型不兼容 | 已按 6.6 改为 `probe(epf, id)`；更新 `pci_epf_infer.c` |
 | `No such device` / magic 不对 | EP 未 start，或仍绑着 pci_epf_test |
 | DMA channel 失败 | 需按 pci-epf-test 的 filter 微调（见 dmesg） |

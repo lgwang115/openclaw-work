@@ -343,7 +343,8 @@ static struct pci_epf_header epf_infer_header = {
 	.interrupt_pin	= PCI_INTERRUPT_INTA,
 };
 
-static int epf_infer_probe(struct pci_epf *epf)
+static int epf_infer_probe(struct pci_epf *epf,
+			   const struct pci_epf_device_id *id)
 {
 	struct epf_infer *ctx;
 
@@ -366,7 +367,8 @@ static const struct pci_epf_device_id epf_infer_ids[] = {
 	{},
 };
 
-static const struct pci_epf_ops epf_infer_ops = {
+/* Not const: pci_epf_driver.ops is struct pci_epf_ops * on this kernel */
+static struct pci_epf_ops epf_infer_ops = {
 	.bind	= epf_infer_bind,
 	.unbind	= epf_infer_unbind,
 };

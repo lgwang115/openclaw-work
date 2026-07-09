@@ -2,12 +2,15 @@
 /*
  * pci_epf_infer — minimum-latency PCIe EP function (A2000 / C1200)
  *
+ * Critical: BAR/header/doorbell must be programmed in epc event .core_init,
+ * NOT only in .bind. On this platform `echo 1 > start` re-inits the
+ * controller; programming BARs in bind (before start) gets wiped, and the
+ * host then only sees hardware-default BAR1/2/4 with no Region 0.
+ *
  * Latency path vs pci_epf_test:
  *   doorbell IRQ -> immediate workqueue (NOT 1ms delayed_work)
- *   DMA with preallocated 4MB buffer (no per-xfer alloc / CRC / random)
- *   completion = status register write (RC polls; no MSI on critical path)
- *
- * Build: see Makefile (out-of-tree). Needs kernel tree with pcie-bst.h.
+ *   DMA with preallocated 4MB buffer
+ *   completion = status register (RC polls; no MSI on critical path)
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -21,12 +24,6 @@
 #include <linux/pci_regs.h>
 
 #include "infer_proto.h"
-/*
- * Use the same BST header path as pci-epf-test.c when built in-tree:
- *   drivers/pci/endpoint/functions/pci_epf_infer.c
- * Out-of-tree builds should use install-into-kernel.sh (recommended),
- * because bst_pcie_ep_db_* are typically not EXPORT_SYMBOL'd.
- */
 #include "../../controller/bst/pcie-bst.h"
 
 #define DRV_NAME "pci_epf_infer"
@@ -48,6 +45,7 @@ struct epf_infer {
 	u32			db_msg;
 	spinlock_t		lock;
 	bool			busy;
+	bool			dma_ok;
 };
 
 struct epf_dma_cb {
@@ -166,7 +164,6 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 	struct epf_infer *ctx = arg;
 	unsigned long flags;
 
-	/* Hardirq: only schedule immediate work (may not sleep here). */
 	spin_lock_irqsave(&ctx->lock, flags);
 	if (ctx->busy) {
 		spin_unlock_irqrestore(&ctx->lock, flags);
@@ -201,6 +198,7 @@ static int epf_infer_setup_dma(struct epf_infer *ctx)
 	if (!ctx->buf)
 		return -ENOMEM;
 
+	ctx->dma_ok = true;
 	dev_info(&ctx->epf->dev, "DMA ready, buf %zu @ %pad\n",
 		 ctx->buf_size, &ctx->buf_dma);
 	return 0;
@@ -226,6 +224,7 @@ static void epf_infer_cleanup_dma(struct epf_infer *ctx)
 		dma_release_channel(ctx->dma_rx);
 		ctx->dma_rx = NULL;
 	}
+	ctx->dma_ok = false;
 }
 
 static int epf_infer_setup_doorbell(struct epf_infer *ctx)
@@ -254,15 +253,21 @@ static int epf_infer_setup_doorbell(struct epf_infer *ctx)
 	return 0;
 }
 
-static int epf_infer_set_bar(struct pci_epf *epf)
+static int epf_infer_set_bar0(struct pci_epf *epf)
 {
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
 	struct pci_epf_bar *epf_bar = &epf->bar[BAR_0];
-	size_t align = epc->mem ? epc->mem->window.page_size : PAGE_SIZE;
+	const struct pci_epc_features *features;
+	size_t align = PAGE_SIZE;
 	void *base;
 	int ret;
 
+	features = pci_epc_get_features(epc, epf->func_no, epf->vfunc_no);
+	if (features && features->align)
+		align = features->align;
+
+	memset(epf_bar, 0, sizeof(*epf_bar));
 	epf_bar->flags = PCI_BASE_ADDRESS_SPACE_MEMORY |
 			 PCI_BASE_ADDRESS_MEM_TYPE_32;
 	epf_bar->barno = BAR_0;
@@ -270,8 +275,10 @@ static int epf_infer_set_bar(struct pci_epf *epf)
 
 	base = pci_epf_alloc_space(epf, INFER_BAR0_SIZE, BAR_0, align,
 				   PRIMARY_INTERFACE);
-	if (!base)
+	if (!base) {
+		dev_err(&epf->dev, "pci_epf_alloc_space BAR0 failed\n");
 		return -ENOMEM;
+	}
 
 	ctx->regs = base;
 	memset(ctx->regs, 0, sizeof(*ctx->regs));
@@ -280,39 +287,86 @@ static int epf_infer_set_bar(struct pci_epf *epf)
 
 	ret = pci_epc_set_bar(epc, epf->func_no, epf->vfunc_no, epf_bar);
 	if (ret) {
+		dev_err(&epf->dev, "pci_epc_set_bar BAR0 failed: %d\n", ret);
 		pci_epf_free_space(epf, base, BAR_0, PRIMARY_INTERFACE);
 		ctx->regs = NULL;
+		return ret;
 	}
-	return ret;
+
+	dev_info(&epf->dev, "BAR0 programmed size=%llu phys=%pap\n",
+		 (unsigned long long)epf_bar->size, &epf_bar->phys_addr);
+	return 0;
 }
 
-static int epf_infer_bind(struct pci_epf *epf)
+/*
+ * Called by EPC when controller is ready (after start) — same timing as
+ * pci_epf_test_core_init. This is the correct place to program BARs.
+ */
+static int epf_infer_core_init(struct pci_epf *epf)
 {
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
 	int ret;
 
+	dev_info(&epf->dev, "core_init: programming header/BAR/doorbell\n");
+
 	ret = pci_epc_write_header(epc, epf->func_no, epf->vfunc_no, epf->header);
-	if (ret)
-		return ret;
-
-	ret = epf_infer_set_bar(epf);
-	if (ret)
-		return ret;
-
-	ret = epf_infer_setup_dma(ctx);
-	if (ret)
-		dev_err(&epf->dev, "DMA setup failed: %d (cmds will fail)\n", ret);
-
-	ret = epf_infer_setup_doorbell(ctx);
 	if (ret) {
-		dev_err(&epf->dev, "doorbell setup failed: %d\n", ret);
+		dev_err(&epf->dev, "write_header failed: %d\n", ret);
 		return ret;
+	}
+
+	ret = epf_infer_set_bar0(epf);
+	if (ret)
+		return ret;
+
+	/* DMA can be set up once; safe in core_init */
+	if (!ctx->dma_ok) {
+		ret = epf_infer_setup_dma(ctx);
+		if (ret)
+			dev_err(&epf->dev, "DMA setup failed: %d\n", ret);
+	}
+
+	if (ctx->db_irq < 0) {
+		ret = epf_infer_setup_doorbell(ctx);
+		if (ret) {
+			dev_err(&epf->dev, "doorbell setup failed: %d\n", ret);
+			return ret;
+		}
 	}
 
 	WRITE_ONCE(ctx->regs->db_bar, ctx->db_bar);
 	WRITE_ONCE(ctx->regs->db_offset, ctx->db_offset);
 	WRITE_ONCE(ctx->regs->db_msg, ctx->db_msg);
+	WRITE_ONCE(ctx->regs->magic, INFER_MAGIC);
+	WRITE_ONCE(ctx->regs->status, INFER_STATUS_IDLE);
+
+	dev_info(&epf->dev, "core_init done magic=0x%x db=%u:0x%x\n",
+		 INFER_MAGIC, ctx->db_bar, ctx->db_offset);
+	return 0;
+}
+
+static int epf_infer_link_up(struct pci_epf *epf)
+{
+	dev_info(&epf->dev, "link_up\n");
+	return 0;
+}
+
+static const struct pci_epc_event_ops epf_infer_event_ops = {
+	.core_init	= epf_infer_core_init,
+	.link_up	= epf_infer_link_up,
+};
+
+static int epf_infer_bind(struct pci_epf *epf)
+{
+	struct epf_infer *ctx = epf_get_drvdata(epf);
+
+	/*
+	 * Do NOT program BARs here. Only attach event ops so core_init runs
+	 * at the correct time (when controller starts), matching pci_epf_test.
+	 */
+	epf->event_ops = &epf_infer_event_ops;
+	dev_info(&epf->dev, "bind: event_ops registered (wait for core_init)\n");
 	return 0;
 }
 
@@ -334,6 +388,7 @@ static void epf_infer_unbind(struct pci_epf *epf)
 		ctx->regs = NULL;
 	}
 	epf_infer_cleanup_dma(ctx);
+	epf->event_ops = NULL;
 }
 
 static struct pci_epf_header epf_infer_header = {
@@ -367,7 +422,6 @@ static const struct pci_epf_device_id epf_infer_ids[] = {
 	{},
 };
 
-/* Not const: pci_epf_driver.ops is struct pci_epf_ops * on this kernel */
 static struct pci_epf_ops epf_infer_ops = {
 	.bind	= epf_infer_bind,
 	.unbind	= epf_infer_unbind,

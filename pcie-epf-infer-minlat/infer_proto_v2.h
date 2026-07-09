@@ -88,6 +88,19 @@ struct infer_credit {
 
 #define INFER_IOC_GET_CREDIT        _IOR(INFER_IOC_MAGIC, 13, struct infer_credit)
 
+/* Map an NPU/exporter dma-buf into a PCI bus address for PUSH (RC side). */
+struct infer_map_dmabuf {
+	__s32 dmabuf_fd;
+	__u32 dmabuf_offset;
+	__u64 size;           /* in: bytes to map from offset; 0 = rest of buf */
+	__u64 pci_addr;       /* out: bus addr for PUSH */
+	__u32 flags;          /* 0 */
+	__u32 reserved;
+};
+
+#define INFER_IOC_MAP_DMABUF        _IOWR(INFER_IOC_MAGIC, 14, struct infer_map_dmabuf)
+#define INFER_IOC_UNMAP_DMABUF      _IOW(INFER_IOC_MAGIC, 15, __u64) /* pci_addr */
+
 /* =====================================================================
  * EP ioctls — /dev/pci_epf_infer0
  * ===================================================================== */

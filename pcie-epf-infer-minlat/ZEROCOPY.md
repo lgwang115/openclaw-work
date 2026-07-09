@@ -179,9 +179,14 @@ eDMA 编程点（实现时务必）：在门铃 work 里用 **本包** 的 `regs
 /* RC: userspace VA → pci_addr（要求物理连续且 dma_map 成单段） */
 struct infer_map_req m = { .user_ptr = (uintptr_t)buf, .size = n };
 ioctl(rc_fd, INFER_IOC_MAP_USER, &m);
-struct infer_push p = { .slot = 0, .size = n, .pci_addr = m.pci_addr, ... };
+
+/* RC: dma-buf fd → pci_addr（同样要求单 SG 段） */
+struct infer_map_dmabuf d = { .dmabuf_fd = fd, .dmabuf_offset = 0, .size = n };
+ioctl(rc_fd, INFER_IOC_MAP_DMABUF, &d);
+
+struct infer_push p = { .slot = 0, .size = n, .pci_addr = m.pci_addr /* or d.pci_addr */, ... };
 ioctl(rc_fd, INFER_IOC_PUSH, &p);
-ioctl(rc_fd, INFER_IOC_UNMAP_USER, &m.pci_addr);
+ioctl(rc_fd, INFER_IOC_UNMAP_USER, &m.pci_addr);   /* or UNMAP_DMABUF */
 
 /* EP: dma-buf fd → local_dst（要求 map 后单 SG 段） */
 struct infer_ep_recv_reg r = {
@@ -195,7 +200,19 @@ ioctl(ep_fd, INFER_EP_IOC_POST_RECV, &r);
 ioctl(ep_fd, INFER_EP_IOC_WAIT, &w);
 ```
 
-限制：当前 eDMA 路径用 `prep_slave_single`，**MAP_USER / DMABUF 都要求映射结果为单个连续 DMA 段**；多段 SG 返回 `-EINVAL`。
+限制：当前 eDMA 路径用 `prep_slave_single`，**MAP_USER / MAP_DMABUF / EP DMABUF 都要求映射结果为单个连续 DMA 段**；多段 SG 返回 `-EINVAL`。
+
+### 板测对称 dma-buf（两端都用 fd）
+
+```bash
+# 接收板
+insmod infer_dmabuf_test.ko
+./inferzc ep 0 4096
+
+# 发送板
+insmod infer_dmabuf_test.ko
+./inferzc rc-dmabuf 0 4096
+```
 
 
 ### 板测 v2 smoke（EP staging，验证通路）

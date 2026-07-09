@@ -6,12 +6,13 @@
  * Doorbell lives in BAR0 (hardware, typically offset 0xe00).
  *
  * v1: INFER_IOC_XFER uses driver staging buf_dma.
- * v2: INFER_IOC_PUSH + MAP_USER/UNMAP_USER for external/NPU buffers.
+ * v2: INFER_IOC_PUSH + MAP_USER/MAP_DMABUF for external/NPU buffers.
  */
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/miscdevice.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-buf.h>
 #include <linux/io.h>
 #include <linux/uaccess.h>
 #include <linux/delay.h>
@@ -20,21 +21,32 @@
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/scatterlist.h>
 
 #include "infer_proto_v2.h"
 
 #define DRV_NAME "infer_rc"
-#define INFER_RC_MAX_USER_MAPS 16
+#define INFER_RC_MAX_MAPS 16
 
-struct infer_user_map {
-	bool			in_use;
+enum infer_map_kind {
+	INFER_MAP_NONE = 0,
+	INFER_MAP_USER,
+	INFER_MAP_DMABUF,
+};
+
+struct infer_rc_map {
+	enum infer_map_kind	kind;
+	dma_addr_t		dma_addr;
+	size_t			size;
+	/* USER */
 	struct page		**pages;
 	int			nr_pages;
-	struct sg_table		sgt;
-	bool			sgt_ok;
-	dma_addr_t		dma_addr;	/* returned pci_addr */
-	size_t			size;
-	unsigned long		offset;		/* offset within first page */
+	struct sg_table		user_sgt;
+	bool			user_sgt_ok;
+	/* DMABUF */
+	struct dma_buf		*dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table		*db_sgt;
 };
 
 struct infer_rc {
@@ -52,7 +64,7 @@ struct infer_rc {
 	u32			db_msg;
 	int			ctrl_bar;
 	struct mutex		map_lock;
-	struct infer_user_map	maps[INFER_RC_MAX_USER_MAPS];
+	struct infer_rc_map	maps[INFER_RC_MAX_MAPS];
 };
 
 static void infer_ring_doorbell(struct infer_rc *rc)
@@ -146,31 +158,60 @@ static int infer_do_push(struct infer_rc *rc, struct infer_push *p)
 	return ret;
 }
 
-static void infer_user_map_release(struct infer_rc *rc, struct infer_user_map *m)
+static void infer_rc_map_release(struct infer_rc *rc, struct infer_rc_map *m)
 {
-	if (!m->in_use)
+	if (m->kind == INFER_MAP_NONE)
 		return;
 
-	if (m->sgt_ok) {
-		dma_unmap_sg(&rc->pdev->dev, m->sgt.sgl, m->sgt.nents, DMA_TO_DEVICE);
-		sg_free_table(&m->sgt);
-		m->sgt_ok = false;
+	if (m->kind == INFER_MAP_USER) {
+		if (m->user_sgt_ok) {
+			dma_unmap_sg(&rc->pdev->dev, m->user_sgt.sgl,
+				     m->user_sgt.nents, DMA_TO_DEVICE);
+			sg_free_table(&m->user_sgt);
+			m->user_sgt_ok = false;
+		}
+		if (m->pages) {
+			unpin_user_pages_dirty_lock(m->pages, m->nr_pages, true);
+			kfree(m->pages);
+			m->pages = NULL;
+		}
+		m->nr_pages = 0;
+	} else if (m->kind == INFER_MAP_DMABUF) {
+		if (m->db_sgt && m->attach) {
+			dma_buf_unmap_attachment(m->attach, m->db_sgt,
+						 DMA_TO_DEVICE);
+			m->db_sgt = NULL;
+		}
+		if (m->attach && m->dmabuf) {
+			dma_buf_detach(m->dmabuf, m->attach);
+			m->attach = NULL;
+		}
+		if (m->dmabuf) {
+			dma_buf_put(m->dmabuf);
+			m->dmabuf = NULL;
+		}
 	}
-	if (m->pages) {
-		unpin_user_pages_dirty_lock(m->pages, m->nr_pages, true);
-		kfree(m->pages);
-		m->pages = NULL;
-	}
-	m->nr_pages = 0;
+
 	m->dma_addr = 0;
 	m->size = 0;
-	m->in_use = false;
+	m->kind = INFER_MAP_NONE;
+}
+
+static struct infer_rc_map *infer_rc_map_alloc_slot(struct infer_rc *rc)
+{
+	int i;
+
+	for (i = 0; i < INFER_RC_MAX_MAPS; i++) {
+		if (rc->maps[i].kind == INFER_MAP_NONE)
+			return &rc->maps[i];
+	}
+	return NULL;
 }
 
 static int infer_map_user(struct infer_rc *rc, struct infer_map_req *req)
 {
-	struct infer_user_map *m = NULL;
-	unsigned long uaddr, offset, end;
+	struct infer_rc_map *m;
+	unsigned long uaddr, offset;
 	int nr_pages, pinned, i, nents, ret;
 	struct page **pages;
 
@@ -181,18 +222,12 @@ static int infer_map_user(struct infer_rc *rc, struct infer_map_req *req)
 
 	uaddr = (unsigned long)req->user_ptr;
 	offset = uaddr & ~PAGE_MASK;
-	end = uaddr + req->size;
 	nr_pages = (offset + req->size + PAGE_SIZE - 1) / PAGE_SIZE;
 	if (nr_pages <= 0)
 		return -EINVAL;
 
 	mutex_lock(&rc->map_lock);
-	for (i = 0; i < INFER_RC_MAX_USER_MAPS; i++) {
-		if (!rc->maps[i].in_use) {
-			m = &rc->maps[i];
-			break;
-		}
-	}
+	m = infer_rc_map_alloc_slot(rc);
 	if (!m) {
 		mutex_unlock(&rc->map_lock);
 		return -ENOSPC;
@@ -214,17 +249,16 @@ static int infer_map_user(struct infer_rc *rc, struct infer_map_req *req)
 		return pinned < 0 ? pinned : -EFAULT;
 	}
 
-	/* eDMA prep_slave_single needs one contiguous DMA segment */
 	for (i = 1; i < nr_pages; i++) {
 		if (page_to_pfn(pages[i]) != page_to_pfn(pages[i - 1]) + 1) {
 			unpin_user_pages_dirty_lock(pages, nr_pages, false);
 			kfree(pages);
 			mutex_unlock(&rc->map_lock);
-			return -EINVAL; /* not physically contiguous */
+			return -EINVAL;
 		}
 	}
 
-	ret = sg_alloc_table_from_pages(&m->sgt, pages, nr_pages, offset,
+	ret = sg_alloc_table_from_pages(&m->user_sgt, pages, nr_pages, offset,
 					req->size, GFP_KERNEL);
 	if (ret) {
 		unpin_user_pages_dirty_lock(pages, nr_pages, false);
@@ -233,30 +267,31 @@ static int infer_map_user(struct infer_rc *rc, struct infer_map_req *req)
 		return ret;
 	}
 
-	nents = dma_map_sg(&rc->pdev->dev, m->sgt.sgl, m->sgt.nents, DMA_TO_DEVICE);
+	nents = dma_map_sg(&rc->pdev->dev, m->user_sgt.sgl, m->user_sgt.nents,
+			   DMA_TO_DEVICE);
 	if (nents <= 0) {
-		sg_free_table(&m->sgt);
+		sg_free_table(&m->user_sgt);
 		unpin_user_pages_dirty_lock(pages, nr_pages, false);
 		kfree(pages);
 		mutex_unlock(&rc->map_lock);
 		return nents < 0 ? nents : -EIO;
 	}
 	if (nents != 1) {
-		dma_unmap_sg(&rc->pdev->dev, m->sgt.sgl, m->sgt.nents, DMA_TO_DEVICE);
-		sg_free_table(&m->sgt);
+		dma_unmap_sg(&rc->pdev->dev, m->user_sgt.sgl, m->user_sgt.nents,
+			     DMA_TO_DEVICE);
+		sg_free_table(&m->user_sgt);
 		unpin_user_pages_dirty_lock(pages, nr_pages, false);
 		kfree(pages);
 		mutex_unlock(&rc->map_lock);
-		return -EINVAL; /* IOMMU split into multiple segments */
+		return -EINVAL;
 	}
 
-	m->in_use = true;
+	m->kind = INFER_MAP_USER;
 	m->pages = pages;
 	m->nr_pages = nr_pages;
-	m->sgt_ok = true;
-	m->offset = offset;
+	m->user_sgt_ok = true;
 	m->size = req->size;
-	m->dma_addr = sg_dma_address(m->sgt.sgl);
+	m->dma_addr = sg_dma_address(m->user_sgt.sgl);
 	req->pci_addr = m->dma_addr;
 	mutex_unlock(&rc->map_lock);
 
@@ -265,7 +300,100 @@ static int infer_map_user(struct infer_rc *rc, struct infer_map_req *req)
 	return 0;
 }
 
-static int infer_unmap_user(struct infer_rc *rc, u64 pci_addr)
+static int infer_map_dmabuf(struct infer_rc *rc, struct infer_map_dmabuf *req)
+{
+	struct infer_rc_map *m;
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	dma_addr_t base;
+	size_t dma_len, want, avail;
+
+	if (req->dmabuf_fd < 0)
+		return -EINVAL;
+
+	dmabuf = dma_buf_get(req->dmabuf_fd);
+	if (IS_ERR(dmabuf))
+		return PTR_ERR(dmabuf);
+
+	if (req->dmabuf_offset >= dmabuf->size) {
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+
+	want = req->size ? req->size : (dmabuf->size - req->dmabuf_offset);
+	if (!want || want > INFER_MAX_XFER) {
+		dma_buf_put(dmabuf);
+		return want ? -E2BIG : -EINVAL;
+	}
+	if (req->dmabuf_offset + want > dmabuf->size) {
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+
+	attach = dma_buf_attach(dmabuf, &rc->pdev->dev);
+	if (IS_ERR(attach)) {
+		dma_buf_put(dmabuf);
+		return PTR_ERR(attach);
+	}
+
+	sgt = dma_buf_map_attachment(attach, DMA_TO_DEVICE);
+	if (IS_ERR(sgt)) {
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return PTR_ERR(sgt);
+	}
+
+	if (sgt->nents != 1) {
+		dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+
+	base = sg_dma_address(sgt->sgl);
+	dma_len = sg_dma_len(sgt->sgl);
+	if (req->dmabuf_offset >= dma_len) {
+		dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+	avail = dma_len - req->dmabuf_offset;
+	if (want > avail) {
+		dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+
+	mutex_lock(&rc->map_lock);
+	m = infer_rc_map_alloc_slot(rc);
+	if (!m) {
+		mutex_unlock(&rc->map_lock);
+		dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return -ENOSPC;
+	}
+
+	m->kind = INFER_MAP_DMABUF;
+	m->dmabuf = dmabuf;
+	m->attach = attach;
+	m->db_sgt = sgt;
+	m->size = want;
+	m->dma_addr = base + req->dmabuf_offset;
+	req->pci_addr = m->dma_addr;
+	req->size = want;
+	mutex_unlock(&rc->map_lock);
+
+	dev_dbg(&rc->pdev->dev,
+		"MAP_DMABUF fd=%d off=%u size=%zu -> pci=%pad\n",
+		req->dmabuf_fd, req->dmabuf_offset, want, &m->dma_addr);
+	return 0;
+}
+
+static int infer_unmap_by_pci(struct infer_rc *rc, u64 pci_addr)
 {
 	int i, ret = -ENOENT;
 
@@ -273,9 +401,10 @@ static int infer_unmap_user(struct infer_rc *rc, u64 pci_addr)
 		return -EINVAL;
 
 	mutex_lock(&rc->map_lock);
-	for (i = 0; i < INFER_RC_MAX_USER_MAPS; i++) {
-		if (rc->maps[i].in_use && rc->maps[i].dma_addr == (dma_addr_t)pci_addr) {
-			infer_user_map_release(rc, &rc->maps[i]);
+	for (i = 0; i < INFER_RC_MAX_MAPS; i++) {
+		if (rc->maps[i].kind != INFER_MAP_NONE &&
+		    rc->maps[i].dma_addr == (dma_addr_t)pci_addr) {
+			infer_rc_map_release(rc, &rc->maps[i]);
 			ret = 0;
 			break;
 		}
@@ -289,8 +418,8 @@ static void infer_release_all_maps(struct infer_rc *rc)
 	int i;
 
 	mutex_lock(&rc->map_lock);
-	for (i = 0; i < INFER_RC_MAX_USER_MAPS; i++)
-		infer_user_map_release(rc, &rc->maps[i]);
+	for (i = 0; i < INFER_RC_MAX_MAPS; i++)
+		infer_rc_map_release(rc, &rc->maps[i]);
 	mutex_unlock(&rc->map_lock);
 }
 
@@ -304,6 +433,7 @@ static long infer_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct infer_push push;
 	struct infer_credit credit;
 	struct infer_map_req mapreq;
+	struct infer_map_dmabuf mapdb;
 	__u64 pci_addr;
 	void __user *uarg = (void __user *)arg;
 	int ret;
@@ -359,15 +489,28 @@ static long infer_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (ret)
 			return ret;
 		if (copy_to_user(uarg, &mapreq, sizeof(mapreq))) {
-			infer_unmap_user(rc, mapreq.pci_addr);
+			infer_unmap_by_pci(rc, mapreq.pci_addr);
 			return -EFAULT;
 		}
 		return 0;
 
 	case INFER_IOC_UNMAP_USER:
+	case INFER_IOC_UNMAP_DMABUF:
 		if (copy_from_user(&pci_addr, uarg, sizeof(pci_addr)))
 			return -EFAULT;
-		return infer_unmap_user(rc, pci_addr);
+		return infer_unmap_by_pci(rc, pci_addr);
+
+	case INFER_IOC_MAP_DMABUF:
+		if (copy_from_user(&mapdb, uarg, sizeof(mapdb)))
+			return -EFAULT;
+		ret = infer_map_dmabuf(rc, &mapdb);
+		if (ret)
+			return ret;
+		if (copy_to_user(uarg, &mapdb, sizeof(mapdb))) {
+			infer_unmap_by_pci(rc, mapdb.pci_addr);
+			return -EFAULT;
+		}
+		return 0;
 
 	default:
 		return -ENOTTY;
@@ -518,7 +661,7 @@ static int infer_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	pci_set_drvdata(pdev, rc);
 	dev_info(&pdev->dev,
-		 "infer_rc ready ctrl=BAR%d db=%u:0x%x ep_flags=0x%x MAP_USER /dev/%s\n",
+		 "infer_rc ready ctrl=BAR%d db=%u:0x%x ep_flags=0x%x MAP_USER/DMABUF /dev/%s\n",
 		 rc->ctrl_bar, rc->db_bar, rc->db_offset, ep_flags, rc->misc_name);
 	return 0;
 
@@ -556,5 +699,5 @@ static struct pci_driver infer_driver = {
 };
 
 module_pci_driver(infer_driver);
-MODULE_DESCRIPTION("RC driver for pci_epf_infer (XFER/PUSH/MAP_USER)");
+MODULE_DESCRIPTION("RC driver for pci_epf_infer (XFER/PUSH/MAP_USER/MAP_DMABUF)");
 MODULE_LICENSE("GPL");

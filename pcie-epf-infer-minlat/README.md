@@ -111,4 +111,4 @@ RC: poll BAR1 status until OK  → 返回耗时(ns)
 1. 成对重启纪律不变（BST EP 软复位恢复未修好前）。
 2. EP 侧 DMA 目前搬进 EP 本地 4MB；v1 无 EP 收包接口，不能直接当 rank send/recv。
 3. 双链路 EP2：每板各装 EP 模块 + 对面板装 RC 模块；数据面应按缆单向 WRITE 推送（见 `ZEROCOPY.md`）。
-4. 指定 NPU 地址：`PUSH` + `POST_RECV(ADDR|DMABUF)`；RC 可用 `MAP_USER` 把用户 VA 转成 `pci_addr`（需物理连续单段）。
+4. 指定 NPU 地址：RC 可用 `PUSH` / `MAP_USER` / **`MAP_DMABUF`**；EP 可用 `POST_RECV(ADDR|DMABUF)`。

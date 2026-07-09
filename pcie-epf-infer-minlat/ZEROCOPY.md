@@ -209,8 +209,22 @@ ioctl(ep_fd, INFER_EP_IOC_WAIT, &w);
 ./inferpush rc 0 4096          # PUSH；EP 应打印 payload OK
 ```
 
-期望：EP `WAIT result=0` 且 **`payload OK`**；RC `PUSH result=0`。  
-换 NPU 地址时：EP `POST_RECV` 用 `INFER_EP_REG_F_ADDR` + `local_dst`；RC `PUSH.pci_addr` 用已 `dma_map` 的 NPU_src。
+期望：EP `WAIT result=0` 且 **`payload OK`**；RC `PUSH result=0`。
+
+### 板测 v2 零拷贝接口（MAP_USER + DMABUF）
+
+```bash
+# 接收板
+insmod /userdata/ep_test/infer_dmabuf_test.ko
+./inferzc ep 0 4096
+# 期望: POST_RECV DMABUF ... WAIT result=0 ... payload OK via DMABUF
+
+# 发送板（60s 内）
+./inferzc rc 0 4096
+# 期望: MAP_USER ... -> pci_addr=... ; PUSH result=0
+```
+
+换 NPU 地址时：EP `POST_RECV` 用 `INFER_EP_REG_F_ADDR` 或 NPU 导出的 dma-buf；RC `PUSH.pci_addr` 用已 `dma_map` / `MAP_USER` 的 NPU_src。
 
 
 ## 11. 明确不做的事（本草案）

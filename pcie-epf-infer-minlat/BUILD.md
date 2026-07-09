@@ -51,7 +51,10 @@ make -C $KDIR M=drivers/misc infer_rc.ko
 # 用户态
 ${CROSS_COMPILE}gcc -O2 -Wall -o inferlat inferlat.c
 ${CROSS_COMPILE}gcc -O2 -Wall -o inferpush inferpush.c
+${CROSS_COMPILE}gcc -O2 -Wall -o inferzc inferzc.c
 ```
+
+`infer_dmabuf_test.ko` 由 `install-into-kernel.sh` 编进 `drivers/misc/`（给 `./inferzc ep` 提供 dma-buf fd）。
 
 ## 拷到板子
 

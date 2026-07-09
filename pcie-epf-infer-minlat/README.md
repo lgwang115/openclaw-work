@@ -29,7 +29,9 @@
 - `pci_epf_infer.c` — EP 侧（v1 staging + v2 POST_RECV/PUSH，`/dev/pci_epf_infer0`）
 - `infer_rc.c` — RC 侧（`XFER` + `PUSH`）
 - `inferlat.c` — v1 延迟扫表
-- `inferpush.c` — v2 PUSH/POST_RECV smoke
+- `inferpush.c` — v2 staging smoke（POST_RECV STAGING）
+- `inferzc.c` — v2 零拷贝接口测试（MAP_USER + DMABUF）
+- `infer_dmabuf_test.c` — 测试用连续 dma-buf 导出（`/dev/infer_dmabuf_test`）
 - `infer_proto.h` / `infer_proto_v2.h` — 协议
 - `install-into-kernel.sh` — 推荐编译入口
 - `ZEROCOPY.md` / `BRINGUP.md` / `BUILD.md` — 设计与板测

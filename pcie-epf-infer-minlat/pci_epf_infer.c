@@ -19,6 +19,8 @@
 #include <linux/completion.h>
 #include <linux/workqueue.h>
 #include <linux/io.h>
+#include <linux/miscdevice.h>
+#include <linux/uaccess.h>
 #include <linux/pci-epc.h>
 #include <linux/pci-epf.h>
 #include <linux/pci_regs.h>
@@ -405,34 +407,56 @@ static const struct pci_epc_event_ops epf_infer_event_ops = {
 	.link_up	= epf_infer_link_up,
 };
 
-/* echo 1 > .../functions/pci_epf_infer/func1/reinit  AFTER start */
-static ssize_t reinit_store(struct device *dev, struct device_attribute *attr,
-			    const char *buf, size_t count)
+/* Global: only one function instance is supported for now. */
+static struct epf_infer *g_epf_infer;
+
+/*
+ * /dev/pci_epf_infer_ctl — write "1" AFTER controller start to reprogram
+ * BAR/doorbell (BST start wipes BAR config done during bind).
+ * Avoids hunting for pci-epf sysfs paths.
+ */
+static ssize_t epf_ctl_write(struct file *filp, const char __user *ubuf,
+			     size_t count, loff_t *ppos)
 {
-	struct pci_epf *epf = to_pci_epf(dev);
+	char buf[8];
+	size_t n = min(count, sizeof(buf) - 1);
 	int ret;
 
-	ret = epf_infer_reprogram(epf);
+	if (!g_epf_infer || !g_epf_infer->epf)
+		return -ENODEV;
+	if (copy_from_user(buf, ubuf, n))
+		return -EFAULT;
+	buf[n] = '\0';
+	if (buf[0] != '1')
+		return -EINVAL;
+
+	ret = epf_infer_reprogram(g_epf_infer->epf);
 	return ret ? ret : count;
 }
-static DEVICE_ATTR_WO(reinit);
+
+static const struct file_operations epf_ctl_fops = {
+	.owner	= THIS_MODULE,
+	.write	= epf_ctl_write,
+};
+
+static struct miscdevice epf_ctl_misc = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= "pci_epf_infer_ctl",
+	.fops	= &epf_ctl_fops,
+};
 
 static int epf_infer_bind(struct pci_epf *epf)
 {
-	int ret;
+	struct epf_infer *ctx = epf_get_drvdata(epf);
 
 	/*
 	 * Do NOT program BARs in bind: BST `start` resets the controller and
-	 * wipes them. User must: start -> echo 1 > reinit -> RC rescan.
+	 * wipes them. After start: echo 1 > /dev/pci_epf_infer_ctl
 	 */
 	epf->event_ops = &epf_infer_event_ops;
-	ret = device_create_file(&epf->dev, &dev_attr_reinit);
-	if (ret)
-		dev_warn(&epf->dev, "reinit sysfs create failed: %d\n", ret);
-
+	g_epf_infer = ctx;
 	dev_info(&epf->dev,
-		 "bind ok; AFTER start run: echo 1 > %s/reinit\n",
-		 dev_name(&epf->dev));
+		 "bind ok; AFTER start: echo 1 > /dev/pci_epf_infer_ctl\n");
 	return 0;
 }
 
@@ -441,7 +465,9 @@ static void epf_infer_unbind(struct pci_epf *epf)
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
 
-	device_remove_file(&epf->dev, &dev_attr_reinit);
+	if (g_epf_infer == ctx)
+		g_epf_infer = NULL;
+
 	cancel_work_sync(&ctx->cmd_work);
 
 	if (ctx->db_irq >= 0) {
@@ -507,13 +533,25 @@ static struct pci_epf_driver epf_infer_driver = {
 
 static int __init epf_infer_init(void)
 {
-	return pci_epf_register_driver(&epf_infer_driver);
+	int ret;
+
+	ret = misc_register(&epf_ctl_misc);
+	if (ret)
+		return ret;
+
+	ret = pci_epf_register_driver(&epf_infer_driver);
+	if (ret) {
+		misc_deregister(&epf_ctl_misc);
+		return ret;
+	}
+	return 0;
 }
 module_init(epf_infer_init);
 
 static void __exit epf_infer_exit(void)
 {
 	pci_epf_unregister_driver(&epf_infer_driver);
+	misc_deregister(&epf_ctl_misc);
 }
 module_exit(epf_infer_exit);
 

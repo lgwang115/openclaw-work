@@ -69,15 +69,15 @@ struct infer_push {
 #define INFER_IOC_PUSH              _IOWR(INFER_IOC_MAGIC, 10, struct infer_push)
 
 struct infer_map_req {
-	__u64 user_ptr;
+	__u64 user_ptr;       /* userspace VA (may be unaligned) */
 	__u64 size;
-	__u64 pci_addr;       /* out */
-	__u32 flags;
+	__u64 pci_addr;       /* out: bus addr for PUSH */
+	__u32 flags;          /* 0 */
 	__u32 reserved;
 };
 
 #define INFER_IOC_MAP_USER          _IOWR(INFER_IOC_MAGIC, 11, struct infer_map_req)
-#define INFER_IOC_UNMAP_USER        _IOW(INFER_IOC_MAGIC, 12, __u64)
+#define INFER_IOC_UNMAP_USER        _IOW(INFER_IOC_MAGIC, 12, __u64) /* pci_addr from MAP_USER */
 
 struct infer_credit {
 	__u32 posted_mask;
@@ -97,10 +97,10 @@ struct infer_credit {
 struct infer_ep_recv_reg {
 	__u32 slot;
 	__u32 flags;          /* INFER_EP_REG_F_* */
-	__u64 capacity;
-	__u64 local_dst;      /* phys/IOVA for EP eDMA */
-	__s32 dmabuf_fd;      /* reserved; dmabuf not wired yet */
-	__u32 dmabuf_offset;
+	__u64 capacity;       /* in: max accept; for DMABUF may clamp to buf size */
+	__u64 local_dst;      /* phys/IOVA when INFER_EP_REG_F_ADDR */
+	__s32 dmabuf_fd;      /* when INFER_EP_REG_F_DMABUF */
+	__u32 dmabuf_offset;  /* byte offset within dma-buf */
 };
 
 #define INFER_EP_REG_F_ADDR         (1u << 0)

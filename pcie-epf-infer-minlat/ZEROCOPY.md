@@ -169,9 +169,34 @@ eDMA 编程点（实现时务必）：在门铃 work 里用 **本包** 的 `regs
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | P0 | 文档 + `infer_proto_v2.h` | 评审通过 |
-| **P1/P2（已接线）** | EP：`/dev/pci_epf_infer0` POST_RECV/WAIT；门铃 PUSH 用 `slot.local_dst`；RC：`INFER_IOC_PUSH` + `GET_CREDIT` | `inferpush` smoke；`inferlat` 仍可用 |
-| P3 | POST_RECV 传入真实 NPU/dma-buf 地址；双 slot 流水 | 端到端每包换地址零拷贝 |
+| **P1/P2（已接线）** | EP：`POST_RECV`/`WAIT`（ADDR/STAGING/**DMABUF**）；RC：`PUSH` + **`MAP_USER`/`UNMAP_USER`** + `GET_CREDIT` | `inferpush`；`inferlat` |
+| P3 | 用真实 NPU/dma-buf 地址做端到端零拷贝联调 | payload 进 NPU buffer |
 | P4 | 推理 runtime 绑定 | 业务路径 |
+
+### MAP_USER / DMABUF 用法（runtime）
+
+```c
+/* RC: userspace VA → pci_addr（要求物理连续且 dma_map 成单段） */
+struct infer_map_req m = { .user_ptr = (uintptr_t)buf, .size = n };
+ioctl(rc_fd, INFER_IOC_MAP_USER, &m);
+struct infer_push p = { .slot = 0, .size = n, .pci_addr = m.pci_addr, ... };
+ioctl(rc_fd, INFER_IOC_PUSH, &p);
+ioctl(rc_fd, INFER_IOC_UNMAP_USER, &m.pci_addr);
+
+/* EP: dma-buf fd → local_dst（要求 map 后单 SG 段） */
+struct infer_ep_recv_reg r = {
+  .slot = 0,
+  .flags = INFER_EP_REG_F_DMABUF,
+  .dmabuf_fd = fd,
+  .dmabuf_offset = 0,
+  .capacity = n,
+};
+ioctl(ep_fd, INFER_EP_IOC_POST_RECV, &r);
+ioctl(ep_fd, INFER_EP_IOC_WAIT, &w);
+```
+
+限制：当前 eDMA 路径用 `prep_slave_single`，**MAP_USER / DMABUF 都要求映射结果为单个连续 DMA 段**；多段 SG 返回 `-EINVAL`。
+
 
 ### 板测 v2 smoke（EP staging，验证通路）
 

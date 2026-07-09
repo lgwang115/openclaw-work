@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-buf.h>
 #include <linux/completion.h>
 #include <linux/workqueue.h>
 #include <linux/io.h>
@@ -22,6 +23,7 @@
 #include <linux/pci_regs.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
+#include <linux/scatterlist.h>
 
 #include "infer_proto_v2.h"
 #include "../../controller/bst/pcie-bst.h"
@@ -35,6 +37,10 @@ struct epf_infer_slot {
 	u32			xfer_size;
 	u32			seq;
 	bool			use_staging;
+	/* optional dma-buf backing (released on WAIT/UNREG/re-POST) */
+	struct dma_buf		*dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table		*sgt;
 };
 
 struct epf_infer {
@@ -64,6 +70,22 @@ struct epf_infer {
 };
 
 static struct epf_infer *g_epf_infer;
+
+static void epf_slot_release_dmabuf(struct epf_infer_slot *slot)
+{
+	if (slot->sgt && slot->attach) {
+		dma_buf_unmap_attachment(slot->attach, slot->sgt, DMA_FROM_DEVICE);
+		slot->sgt = NULL;
+	}
+	if (slot->attach && slot->dmabuf) {
+		dma_buf_detach(slot->dmabuf, slot->attach);
+		slot->attach = NULL;
+	}
+	if (slot->dmabuf) {
+		dma_buf_put(slot->dmabuf);
+		slot->dmabuf = NULL;
+	}
+}
 
 static void epf_infer_update_credit_locked(struct epf_infer *ctx)
 {
@@ -402,7 +424,8 @@ static int epf_infer_set_ctrl_bar(struct pci_epf *epf)
 	memset(ctx->regs, 0, sizeof(*ctx->regs));
 	ctx->regs->magic = INFER_MAGIC;
 	ctx->regs->status = INFER_STATUS_IDLE;
-	ctx->regs->ep_flags = INFER_EP_F_ZEROCOPY | INFER_EP_F_MULTI_SLOT;
+	ctx->regs->ep_flags = INFER_EP_F_ZEROCOPY | INFER_EP_F_MULTI_SLOT |
+			      INFER_EP_F_DMABUF;
 
 	ret = pci_epc_set_bar(epc, epf->func_no, epf->vfunc_no, epf_bar);
 	if (ret) {
@@ -449,6 +472,7 @@ static int epf_infer_reprogram(struct pci_epf *epf)
 	}
 
 	for (i = 0; i < INFER_V2_SLOTS; i++) {
+		epf_slot_release_dmabuf(&ctx->slots[i]);
 		ctx->slots[i].state = INFER_SLOT_EMPTY;
 		ctx->slots[i].local_dst = 0;
 		ctx->slots[i].capacity = 0;
@@ -460,7 +484,8 @@ static int epf_infer_reprogram(struct pci_epf *epf)
 	WRITE_ONCE(ctx->regs->magic, INFER_MAGIC);
 	WRITE_ONCE(ctx->regs->status, INFER_STATUS_IDLE);
 	WRITE_ONCE(ctx->regs->ep_flags,
-		   INFER_EP_F_ZEROCOPY | INFER_EP_F_MULTI_SLOT);
+		   INFER_EP_F_ZEROCOPY | INFER_EP_F_MULTI_SLOT |
+		   INFER_EP_F_DMABUF);
 	epf_infer_update_credit_locked(ctx);
 	wmb();
 
@@ -519,24 +544,106 @@ static struct miscdevice epf_ctl_misc = {
 
 /* ---- /dev/pci_epf_infer0 (POST_RECV / WAIT) ---- */
 
+static int epf_post_recv_dmabuf(struct epf_infer *ctx,
+				struct infer_ep_recv_reg *reg,
+				dma_addr_t *dst_out, size_t *cap_out,
+				struct dma_buf **db_out,
+				struct dma_buf_attachment **att_out,
+				struct sg_table **sgt_out)
+{
+	struct device *dma_dev;
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	dma_addr_t base;
+	size_t dma_len, avail;
+
+	if (reg->dmabuf_fd < 0)
+		return -EINVAL;
+	if (!ctx->epf || !ctx->epf->epc)
+		return -ENODEV;
+
+	dma_dev = ctx->epf->epc->dev.parent;
+	dmabuf = dma_buf_get(reg->dmabuf_fd);
+	if (IS_ERR(dmabuf))
+		return PTR_ERR(dmabuf);
+
+	if (reg->dmabuf_offset >= dmabuf->size) {
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+
+	attach = dma_buf_attach(dmabuf, dma_dev);
+	if (IS_ERR(attach)) {
+		dma_buf_put(dmabuf);
+		return PTR_ERR(attach);
+	}
+
+	sgt = dma_buf_map_attachment(attach, DMA_FROM_DEVICE);
+	if (IS_ERR(sgt)) {
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return PTR_ERR(sgt);
+	}
+
+	/* prep_slave_single needs one contiguous DMA address */
+	if (sgt->nents != 1) {
+		dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+
+	base = sg_dma_address(sgt->sgl);
+	dma_len = sg_dma_len(sgt->sgl);
+	if (reg->dmabuf_offset >= dma_len) {
+		dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+
+	avail = dma_len - reg->dmabuf_offset;
+	if (reg->capacity && reg->capacity < avail)
+		avail = reg->capacity;
+
+	*dst_out = base + reg->dmabuf_offset;
+	*cap_out = avail;
+	*db_out = dmabuf;
+	*att_out = attach;
+	*sgt_out = sgt;
+	return 0;
+}
+
 static int epf_post_recv_slot(struct epf_infer *ctx, struct infer_ep_recv_reg *reg)
 {
 	struct epf_infer_slot *slot;
+	struct epf_infer_slot old = {};
 	unsigned long flags;
-	dma_addr_t dst;
-	size_t cap;
+	dma_addr_t dst = 0;
+	size_t cap = 0;
+	struct dma_buf *dmabuf = NULL;
+	struct dma_buf_attachment *attach = NULL;
+	struct sg_table *sgt = NULL;
+	bool use_staging = false;
+	int ret;
 
 	if (reg->slot >= INFER_V2_SLOTS)
 		return -EINVAL;
 
-	if (reg->flags & INFER_EP_REG_F_DMABUF)
-		return -EOPNOTSUPP;
-
-	if (reg->flags & INFER_EP_REG_F_STAGING) {
+	if (reg->flags & INFER_EP_REG_F_DMABUF) {
+		ret = epf_post_recv_dmabuf(ctx, reg, &dst, &cap,
+					   &dmabuf, &attach, &sgt);
+		if (ret)
+			return ret;
+	} else if (reg->flags & INFER_EP_REG_F_STAGING) {
 		if (!ctx->buf)
 			return -ENODEV;
 		dst = ctx->buf_dma;
 		cap = ctx->buf_size;
+		if (reg->capacity && reg->capacity < cap)
+			cap = reg->capacity;
+		use_staging = true;
 	} else if (reg->flags & INFER_EP_REG_F_ADDR) {
 		if (!reg->local_dst || !reg->capacity)
 			return -EINVAL;
@@ -550,24 +657,41 @@ static int epf_post_recv_slot(struct epf_infer *ctx, struct infer_ep_recv_reg *r
 	slot = &ctx->slots[reg->slot];
 	if (slot->state == INFER_SLOT_BUSY) {
 		spin_unlock_irqrestore(&ctx->lock, flags);
+		if (dmabuf) {
+			dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+		}
 		return -EBUSY;
 	}
+	/* stash previous dmabuf to release outside the lock */
+	old.dmabuf = slot->dmabuf;
+	old.attach = slot->attach;
+	old.sgt = slot->sgt;
+
 	slot->local_dst = dst;
 	slot->capacity = cap;
-	slot->use_staging = !!(reg->flags & INFER_EP_REG_F_STAGING);
+	slot->use_staging = use_staging;
+	slot->dmabuf = dmabuf;
+	slot->attach = attach;
+	slot->sgt = sgt;
 	slot->state = INFER_SLOT_POSTED;
 	slot->xfer_size = 0;
 	epf_infer_update_credit_locked(ctx);
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
-	dev_dbg(&ctx->epf->dev, "POST_RECV slot=%u dst=%pad cap=%zu staging=%d\n",
-		reg->slot, &dst, cap, slot->use_staging);
+	epf_slot_release_dmabuf(&old);
+
+	dev_dbg(&ctx->epf->dev,
+		"POST_RECV slot=%u dst=%pad cap=%zu staging=%d dmabuf=%d\n",
+		reg->slot, &dst, cap, use_staging, !!dmabuf);
 	return 0;
 }
 
 static int epf_wait_slot(struct epf_infer *ctx, struct infer_ep_wait *w)
 {
 	struct epf_infer_slot *slot;
+	struct epf_infer_slot release = {};
 	unsigned long flags;
 	long timeout;
 	u64 us = w->timeout_us ? w->timeout_us : 1000000ull;
@@ -598,20 +722,31 @@ static int epf_wait_slot(struct epf_infer *ctx, struct infer_ep_wait *w)
 	slot = &ctx->slots[w->slot];
 	if (slot->state == INFER_SLOT_ERROR) {
 		w->result = -EIO;
-		slot->state = INFER_SLOT_EMPTY;
 		ret = -EIO;
 	} else if (slot->state == INFER_SLOT_DONE) {
 		w->size = slot->xfer_size;
 		w->seq = slot->seq;
 		w->result = 0;
-		slot->state = INFER_SLOT_EMPTY;
 		ret = 0;
 	} else {
 		w->result = -EAGAIN;
 		ret = -EAGAIN;
 	}
+	if (ret != -EAGAIN) {
+		release.dmabuf = slot->dmabuf;
+		release.attach = slot->attach;
+		release.sgt = slot->sgt;
+		slot->dmabuf = NULL;
+		slot->attach = NULL;
+		slot->sgt = NULL;
+		slot->state = INFER_SLOT_EMPTY;
+		slot->local_dst = 0;
+		slot->capacity = 0;
+	}
 	epf_infer_update_credit_locked(ctx);
 	spin_unlock_irqrestore(&ctx->lock, flags);
+
+	epf_slot_release_dmabuf(&release);
 	return ret;
 }
 
@@ -646,11 +781,22 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 			spin_unlock_irqrestore(&ctx->lock, flags);
 			return -EBUSY;
 		}
-		ctx->slots[slot].state = INFER_SLOT_EMPTY;
-		ctx->slots[slot].local_dst = 0;
-		ctx->slots[slot].capacity = 0;
-		epf_infer_update_credit_locked(ctx);
-		spin_unlock_irqrestore(&ctx->lock, flags);
+		{
+			struct epf_infer_slot release = {};
+
+			release.dmabuf = ctx->slots[slot].dmabuf;
+			release.attach = ctx->slots[slot].attach;
+			release.sgt = ctx->slots[slot].sgt;
+			ctx->slots[slot].dmabuf = NULL;
+			ctx->slots[slot].attach = NULL;
+			ctx->slots[slot].sgt = NULL;
+			ctx->slots[slot].state = INFER_SLOT_EMPTY;
+			ctx->slots[slot].local_dst = 0;
+			ctx->slots[slot].capacity = 0;
+			epf_infer_update_credit_locked(ctx);
+			spin_unlock_irqrestore(&ctx->lock, flags);
+			epf_slot_release_dmabuf(&release);
+		}
 		return 0;
 
 	case INFER_EP_IOC_POST:
@@ -690,7 +836,9 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 		if (ctx->regs)
 			info.ep_flags = READ_ONCE(ctx->regs->ep_flags);
 		else
-			info.ep_flags = INFER_EP_F_ZEROCOPY | INFER_EP_F_MULTI_SLOT;
+			info.ep_flags = INFER_EP_F_ZEROCOPY |
+					INFER_EP_F_MULTI_SLOT |
+					INFER_EP_F_DMABUF;
 		if (copy_to_user(uarg, &info, sizeof(info)))
 			return -EFAULT;
 		return 0;
@@ -747,11 +895,15 @@ static void epf_infer_unbind(struct pci_epf *epf)
 {
 	struct epf_infer *ctx = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
+	int i;
 
 	if (g_epf_infer == ctx)
 		g_epf_infer = NULL;
 
 	cancel_work_sync(&ctx->cmd_work);
+
+	for (i = 0; i < INFER_V2_SLOTS; i++)
+		epf_slot_release_dmabuf(&ctx->slots[i]);
 
 	if (ctx->ep_misc_registered) {
 		misc_deregister(&ctx->ep_misc);

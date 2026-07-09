@@ -1,8 +1,8 @@
-# 零拷贝 NPU 互联协议草案（双缆单向推送）
+# 零拷贝 NPU 互联协议（双缆单向推送）
 
-> 状态：设计草案，驱动尚未实现。  
-> 现行可跑通的延迟基线仍是 v1（staging 4MB + `INFER_IOC_XFER`），见 `BRINGUP.md`。  
-> 本文件 + `infer_proto_v2.h` 定义目标接口，供评审后再改 `pci_epf_infer` / `infer_rc`。
+> 状态：**驱动已接线**（P1/P2）；真实 NPU runtime 联调为 P3。  
+> v1 延迟基线（staging + `INFER_IOC_XFER`）：4KB 中位 **~17µs**，见 `BRINGUP.md`。  
+> 本文件 + `infer_proto_v2.h` 描述接口与拓扑；实现见 `pci_epf_infer.c` / `infer_rc.c`。
 
 ## 1. 目标
 
@@ -169,7 +169,7 @@ eDMA 编程点（实现时务必）：在门铃 work 里用 **本包** 的 `regs
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | P0 | 文档 + `infer_proto_v2.h` | 评审通过 |
-| **P1/P2（已接线）** | EP：`POST_RECV`/`WAIT`（ADDR/STAGING/**DMABUF**）；RC：`PUSH` + **`MAP_USER`/`UNMAP_USER`** + `GET_CREDIT` | `inferpush`；`inferlat` |
+| **P1/P2（已接线+板测）** | EP：`POST_RECV`/`WAIT`（ADDR/STAGING/**DMABUF**）；RC：`PUSH` + **`MAP_USER`/`MAP_DMABUF`** + `GET_CREDIT` | `inferpush` / `inferzc` 通过；v1 `inferlat` 4KB ~17µs |
 | P3 | 用真实 NPU/dma-buf 地址做端到端零拷贝联调 | payload 进 NPU buffer |
 | P4 | 推理 runtime 绑定 | 业务路径 |
 

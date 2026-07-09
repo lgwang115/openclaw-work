@@ -4,16 +4,16 @@
 
 | 项目 | pci_epf_test | 本方案 |
 | --- | --- | --- |
-| 命令发现 | 1ms `delayed_work` 轮询；门铃 handler 空转 | 门铃 IRQ → 立刻 `queue_work` |
+| 命令发现 | 1ms `delayed_work` 轮询；门铃 handler 空转 | 门铃 IRQ → **直接提交 eDMA**（无 workqueue） |
 | 完成通知 | MSI/MSI-X（你们链路上会随机失效） | **RC 轮询 status 寄存器**（关键路径不用中断） |
-| 缓冲区 | 每次传输分配 + CRC + 随机数 | 启动预分配 4MB，无 CRC |
-| 目标 | 功能验证 | 4KB 端到端目标 **20~40µs**（相对 dmalat 的 2~5ms） |
+| 缓冲区 | 每次传输分配 + CRC + 随机数 | 启动预分配 4MB，无 CRC；v2 可指定 ADDR/DMABUF |
+| 目标 | 功能验证 | 4KB 端到端目标 **20~40µs**（实测中位 **~17µs**） |
 
 协议见 `infer_proto.h`。设备 ID：`1ef1:0301`。
 
 完整工作记录（设计动机、平台坑、编译部署、板测步骤、实测数据）见 **`BRINGUP.md`**。  
 编译与拷板细节见 **`BUILD.md`**。  
-零拷贝 NPU 互联（双缆单向推送、指定 NPU 地址）草案见 **`ZEROCOPY.md`** / `infer_proto_v2.h`（尚未接线到驱动）。
+零拷贝 NPU 互联（双缆单向推送、指定 NPU 地址）见 **`ZEROCOPY.md`** / `infer_proto_v2.h`（驱动已接线；真实 NPU runtime 待联调）。
 
 ## BST BAR 布局（必读）
 
@@ -95,20 +95,23 @@ ls /dev/infer_rc0
 ```bash
 ./inferlat /dev/infer_rc0 w 100
 ./inferlat /dev/infer_rc0 r 100
-# 验收参考: 4KB 中位 ~24µs，2MB ~6 GB/s（见 BRINGUP.md）
+# 验收参考: 4KB 中位 ~17µs，2MB ~6 GB/s（见 BRINGUP.md）
 ```
 
 ## 关键路径时序
 
 ```
 RC: status=IDLE → size/pci_addr → command → wmb → writel(BAR0+db_off)
-EP: doorbell IRQ → queue_work → DMA → status=OK（写在 BAR1）
+EP: doorbell IRQ → 直接 submit eDMA → DMA callback 写 status=OK（BAR1）
 RC: poll BAR1 status until OK  → 返回耗时(ns)
 ```
+
+单 outstanding（`ctx->busy`）；同缆串行。双缆各自独立。
 
 ## 已知限制
 
 1. 成对重启纪律不变（BST EP 软复位恢复未修好前）。
-2. EP 侧 DMA 目前搬进 EP 本地 4MB；v1 无 EP 收包接口，不能直接当 rank send/recv。
+2. v1 `inferlat` 仍走 EP 本地 4MB staging；业务收包用 v2 `POST_RECV`/`WAIT`。
 3. 双链路 EP2：每板各装 EP 模块 + 对面板装 RC 模块；数据面应按缆单向 WRITE 推送（见 `ZEROCOPY.md`）。
 4. 指定 NPU 地址：RC 可用 `PUSH` / `MAP_USER` / **`MAP_DMABUF`**；EP 可用 `POST_RECV(ADDR|DMABUF)`。
+5. `prep_slave_single`：MAP_* / EP DMABUF 要求单连续 DMA 段。

@@ -11,7 +11,8 @@
 
 协议见 `infer_proto.h`。设备 ID：`1ef1:0301`。
 
-完整工作记录（设计动机、平台坑、编译部署、板测步骤、实测数据）见 **`BRINGUP.md`**。
+完整工作记录（设计动机、平台坑、编译部署、板测步骤、实测数据）见 **`BRINGUP.md`**。  
+编译与拷板细节见 **`BUILD.md`**。
 
 ## BST BAR 布局（必读）
 
@@ -24,14 +25,23 @@
 
 ## 文件
 
-- `pci_epf_infer.c` — EP 侧 function 驱动（进树编时 include 内核 `pcie-bst.h`）
+- `pci_epf_infer.c` — EP 侧 function 驱动（进树编时 `#include ../../controller/bst/pcie-bst.h`）
 - `infer_rc.c` — RC 侧主机驱动
 - `inferlat.c` — 用户态延迟扫表（4KB→2MB）
 - `infer_proto.h` — 共享协议
+- `install-into-kernel.sh` — 推荐编译入口（拷进内核树再编）
+- `Makefile` — out-of-tree 备用（EP 通常链不上门铃符号，勿作主路径）
+- `BUILD.md` / `BRINGUP.md` — 编译部署与完整板测记录
 
 ## 编译
 
-见 `BUILD.md`（推荐 `./install-into-kernel.sh`）。
+```bash
+./install-into-kernel.sh /path/to/linux-6.6
+# 产物: pci_epf_infer.ko、infer_rc.ko、inferlat
+# 两板都要拷这三份（拓扑对称）
+```
+
+详见 `BUILD.md`。
 
 ## 部署与枚举（两板成对重启后）
 
@@ -49,16 +59,17 @@ ln -s functions/pci_epf_infer/func1 controllers/73000000.pcie2_ep/
 echo 1 > controllers/73000000.pcie2_ep/start
 sleep 1
 echo 1 > /dev/pci_epf_infer_ctl    # 必须：start 会清掉 bind 时的 BAR/ATU
-dmesg | grep reprogram | tail -3
-# 必须: reprogram done magic=0x494e4652
+dmesg | grep -E 'reprogram|ctrl BAR|eDMA' | tail -5
 # 必须: ctrl BAR1 programmed ...
+# 必须: eDMA channels: tx=dma1chan0 rx=dma1chan8
+# 必须: reprogram done magic=0x494e4652
 ```
 
 **再在本板做对端 EP 的 RC 枚举：**
 
 ```bash
 rmmod infer_rc 2>/dev/null
-echo 1 > /sys/bus/pci/devices/0000:01:00.0/remove 2>/dev/null
+echo 1 > /sys/bus/pci/devices/0000:01:00.0/remove 2>/dev/null || true
 sleep 1
 echo 1 > /sys/bus/pci/rescan
 setpci -s 0000:00:00.0 CAP_EXP+10.w=0020
@@ -66,25 +77,22 @@ sleep 1
 
 lspci -n -s 01:00.0
 # 期望: 1ef1:0301
-lspci -vv -s 01:00.0 | grep Region
 
-# 用 BAR1 的 CPU 地址验 magic（resource 第 2 行，不是第 1 行）
-sed -n '2p' /sys/bus/pci/devices/0000:01:00.0/resource
-# 例: 0x0000000900b00000 ...  →  busybox devmem 0x900b00000 32
-# 期望: 0x494E4652
-# BAR0（第 1 行）读到 0 / 0xFFFFFFFF 是正常的
-
-insmod /userdata/ep_test/infer_rc.ko
-dmesg | tail -10
-# 期望: infer regs on BAR1 ... /dev/infer_rc0
+cd /userdata/ep_test
+insmod ./infer_rc.ko
+dmesg | grep infer_rc | tail -5
+# 期望: infer regs on BAR1 ... doorbell mapped BAR0+0xe00 ... /dev/infer_rc0
 ls /dev/infer_rc0
 ```
+
+> 不要在 `insmod infer_rc` 之前用 `devmem` 验 magic：设备未 enable Memory 时 BAR1 也常读到 `0xFFFFFFFF`。以 dmesg 为准。
 
 **测延迟：**
 
 ```bash
 ./inferlat /dev/infer_rc0 w 100
 ./inferlat /dev/infer_rc0 r 100
+# 验收参考: 4KB 中位 ~24µs，2MB ~6 GB/s（见 BRINGUP.md）
 ```
 
 ## 关键路径时序

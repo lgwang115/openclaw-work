@@ -30,13 +30,12 @@ MISC_DIR="$KDIR/drivers/misc"
 echo "==> Install EP sources into $EP_DIR"
 cp -v "$SRC/pci_epf_infer.c" "$SRC/infer_proto.h" "$EP_DIR/"
 
-# Ensure include matches in-tree pci-epf-test style
+# In-tree build uses relative include of controller/bst/pcie-bst.h
 if ! grep -q 'pcie-bst.h' "$EP_DIR/pci_epf_infer.c"; then
 	echo "ERROR: pci_epf_infer.c should include pcie-bst.h"
 	exit 1
 fi
 
-# Add to Makefile once
 if ! grep -q 'pci_epf_infer.o' "$EP_DIR/Makefile"; then
 	echo 'obj-m += pci_epf_infer.o' >> "$EP_DIR/Makefile"
 	echo "appended obj-m += pci_epf_infer.o to $EP_DIR/Makefile"
@@ -67,6 +66,9 @@ echo
 echo "DONE. Artifacts:"
 ls -l "$EP_DIR/pci_epf_infer.ko" "$MISC_DIR/infer_rc.ko" "$SRC/inferlat"
 echo
-echo "Copy to boards:"
-echo "  scp $EP_DIR/pci_epf_infer.ko root@<EP>:/userdata/ep_test/"
-echo "  scp $MISC_DIR/infer_rc.ko $SRC/inferlat root@<RC>:/userdata/ep_test/"
+echo "Dual-board topology: copy ALL three artifacts to BOTH boards:"
+echo "  for IP in <A_IP> <B_IP>; do"
+echo "    scp $EP_DIR/pci_epf_infer.ko $MISC_DIR/infer_rc.ko $SRC/inferlat \\"
+echo "        root@\$IP:/userdata/ep_test/"
+echo "  done"
+echo "Then follow BRINGUP.md / BUILD.md (paired reboot → EP+ctl → RC → inferlat)."

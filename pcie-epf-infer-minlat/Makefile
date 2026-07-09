@@ -1,5 +1,8 @@
-# Out-of-tree Makefile (may fail link if BST doorbell symbols are not exported).
-# Preferred: ./install-into-kernel.sh /home/bst/workspace/linux-6.6
+# Out-of-tree Makefile — NOT recommended for pci_epf_infer.
+# Prefer: ./install-into-kernel.sh /path/to/linux-6.6
+#
+# Out-of-tree EP builds usually fail to link: bst_pcie_ep_db_* are not
+# EXPORT_SYMBOL. infer_rc.ko and inferlat can still be built here.
 #
 #   make KDIR=~/workspace/linux-6.6 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
 
@@ -8,9 +11,7 @@ obj-m += infer_rc.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 KDIR_ABS := $(abspath $(KDIR))
-SRC_ABS := $(abspath $(src))
 
-# For out-of-tree only: fake relative include by adding a symlink step in build.sh
 ccflags-y += -I$(src)
 
 .PHONY: all modules clean inferlat check-version
@@ -25,7 +26,7 @@ check-version:
 	fi
 
 modules:
-	@echo "NOTE: prefer ./install-into-kernel.sh for EP module (doorbell symbols)."
+	@echo "NOTE: prefer ./install-into-kernel.sh (EP needs in-tree pcie-bst.h + unexported doorbell symbols)."
 	$(MAKE) -C $(KDIR_ABS) M=$(CURDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
 
 inferlat: inferlat.c infer_proto.h

@@ -34,10 +34,13 @@ struct epf_infer {
 	void			*buf;
 	dma_addr_t		buf_dma;
 	size_t			buf_size;
-	struct dma_chan		*dma_tx;
-	struct dma_chan		*dma_rx;
+	struct dma_chan		*dma_tx;	/* MEM_TO_DEV: EP -> RC */
+	struct dma_chan		*dma_rx;	/* DEV_TO_MEM: RC -> EP */
 	struct completion	xfer_done;
 	enum dma_status		xfer_status;
+	/* current in-flight transfer (single outstanding by design) */
+	struct dma_chan		*cur_chan;
+	dma_cookie_t		cur_cookie;
 	struct work_struct	cmd_work;
 	int			db_irq;
 	u32			db_bar;
@@ -48,64 +51,68 @@ struct epf_infer {
 	bool			dma_ok;
 };
 
-struct epf_dma_cb {
-	struct epf_infer	*ctx;
-	struct dma_chan		*chan;
-	dma_cookie_t		cookie;
-};
-
 static void epf_infer_dma_cb(void *param)
 {
-	struct epf_dma_cb *cb = param;
+	struct epf_infer *ctx = param;
 
-	cb->ctx->xfer_status = dma_async_is_tx_complete(cb->chan, cb->cookie,
-							NULL, NULL);
-	complete(&cb->ctx->xfer_done);
+	ctx->xfer_status = dma_async_is_tx_complete(ctx->cur_chan,
+						    ctx->cur_cookie, NULL, NULL);
+	complete(&ctx->xfer_done);
 }
 
+/*
+ * eDMA slave transfer, same as pci_epf_test private-DMA path:
+ * remote PCI address goes into dma_slave_config (the eDMA engine on the
+ * PCIe controller understands PCI bus addresses); local buffer is the
+ * prep_slave_single address. Plain MEMCPY channels must NOT be used here:
+ * a system DMA would treat the RC bus address as a local physical address.
+ */
 static int epf_infer_dma_xfer(struct epf_infer *ctx,
 			      enum dma_transfer_direction dir,
 			      dma_addr_t remote, size_t size)
 {
 	struct dma_chan *chan = (dir == DMA_DEV_TO_MEM) ? ctx->dma_rx : ctx->dma_tx;
 	struct dma_async_tx_descriptor *desc;
-	struct epf_dma_cb cb;
-	dma_addr_t local = ctx->buf_dma;
+	struct dma_slave_config sconf = {};
 	dma_cookie_t cookie;
-	dma_addr_t dst, src;
+	int ret;
 
 	if (!chan)
 		return -ENODEV;
 
-	if (dir == DMA_DEV_TO_MEM) {
-		dst = local;
-		src = remote;
-	} else {
-		dst = remote;
-		src = local;
-	}
+	sconf.direction = dir;
+	if (dir == DMA_MEM_TO_DEV)
+		sconf.dst_addr = remote;
+	else
+		sconf.src_addr = remote;
+
+	ret = dmaengine_slave_config(chan, &sconf);
+	if (ret)
+		return ret;
 
 	reinit_completion(&ctx->xfer_done);
 	ctx->xfer_status = DMA_IN_PROGRESS;
+	ctx->cur_chan = chan;
 
-	desc = dmaengine_prep_dma_memcpy(chan, dst, src, size,
-					 DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
+	desc = dmaengine_prep_slave_single(chan, ctx->buf_dma, size, dir,
+					   DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
 	if (!desc)
 		return -EIO;
 
-	cb.ctx = ctx;
-	cb.chan = chan;
 	desc->callback = epf_infer_dma_cb;
-	desc->callback_param = &cb;
+	desc->callback_param = ctx;
 
 	cookie = dmaengine_submit(desc);
 	if (dma_submit_error(cookie))
 		return -EIO;
-	cb.cookie = cookie;
+	ctx->cur_cookie = cookie;
 	dma_async_issue_pending(chan);
 
-	if (!wait_for_completion_timeout(&ctx->xfer_done, msecs_to_jiffies(100)))
+	if (!wait_for_completion_timeout(&ctx->xfer_done, msecs_to_jiffies(100))) {
+		/* prevent a late callback touching a finished transfer */
+		dmaengine_terminate_sync(chan);
 		return -ETIMEDOUT;
+	}
 	if (ctx->xfer_status != DMA_COMPLETE)
 		return -EIO;
 	return 0;
@@ -176,21 +183,49 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 	return IRQ_HANDLED;
 }
 
+struct epf_dma_filter {
+	struct device *dev;
+	u32 dma_mask;
+};
+
+/* Pick eDMA channels that belong to the PCIe controller (pci_epf_test style) */
+static bool epf_infer_dma_filter(struct dma_chan *chan, void *arg)
+{
+	struct epf_dma_filter *filter = arg;
+	struct dma_slave_caps caps;
+
+	memset(&caps, 0, sizeof(caps));
+	dma_get_slave_caps(chan, &caps);
+
+	return chan->device->dev == filter->dev &&
+	       (filter->dma_mask & caps.directions);
+}
+
 static int epf_infer_setup_dma(struct epf_infer *ctx)
 {
 	struct device *dma_dev = ctx->epf->epc->dev.parent;
+	struct epf_dma_filter filter;
 	dma_cap_mask_t mask;
 
 	dma_cap_zero(mask);
-	dma_cap_set(DMA_MEMCPY, mask);
+	dma_cap_set(DMA_SLAVE, mask);
 
-	ctx->dma_tx = dma_request_channel(mask, NULL, NULL);
-	ctx->dma_rx = dma_request_channel(mask, NULL, NULL);
+	filter.dev = dma_dev;
+	filter.dma_mask = BIT(DMA_DEV_TO_MEM);
+	ctx->dma_rx = dma_request_channel(mask, epf_infer_dma_filter, &filter);
+
+	filter.dma_mask = BIT(DMA_MEM_TO_DEV);
+	ctx->dma_tx = dma_request_channel(mask, epf_infer_dma_filter, &filter);
+
 	if (!ctx->dma_tx || !ctx->dma_rx) {
-		dev_err(&ctx->epf->dev, "failed to get DMA channels (tx=%p rx=%p)\n",
+		dev_err(&ctx->epf->dev,
+			"failed to get eDMA slave channels (tx=%p rx=%p)\n",
 			ctx->dma_tx, ctx->dma_rx);
 		return -ENODEV;
 	}
+
+	dev_info(&ctx->epf->dev, "eDMA channels: tx=%s rx=%s\n",
+		 dma_chan_name(ctx->dma_tx), dma_chan_name(ctx->dma_rx));
 
 	ctx->buf_size = INFER_MAX_XFER;
 	ctx->buf = dma_alloc_coherent(dma_dev, ctx->buf_size, &ctx->buf_dma,
@@ -262,19 +297,26 @@ static int epf_infer_set_bar0(struct pci_epf *epf)
 	size_t align = PAGE_SIZE;
 	int ret;
 
-	features = pci_epc_get_features(epc, epf->func_no, epf->vfunc_no);
-	if (features && features->align)
-		align = features->align;
-
-	memset(epf_bar, 0, sizeof(*epf_bar));
-	epf_bar->flags = PCI_BASE_ADDRESS_SPACE_MEMORY |
-			 PCI_BASE_ADDRESS_MEM_TYPE_32;
-	epf_bar->barno = BAR_0;
-	epf_bar->size = INFER_BAR0_SIZE;
-
+	/*
+	 * Allocate backing memory only once. pci_epf_alloc_space() fills
+	 * epf_bar (phys_addr/addr/size/barno), which must be preserved for
+	 * subsequent reinit calls — do NOT memset epf_bar on re-entry.
+	 */
 	if (!ctx->regs) {
-		void *base = pci_epf_alloc_space(epf, INFER_BAR0_SIZE, BAR_0,
-						 align, PRIMARY_INTERFACE);
+		void *base;
+
+		features = pci_epc_get_features(epc, epf->func_no, epf->vfunc_no);
+		if (features && features->align)
+			align = features->align;
+
+		memset(epf_bar, 0, sizeof(*epf_bar));
+		epf_bar->flags = PCI_BASE_ADDRESS_SPACE_MEMORY |
+				 PCI_BASE_ADDRESS_MEM_TYPE_32;
+		epf_bar->barno = BAR_0;
+		epf_bar->size = INFER_BAR0_SIZE;
+
+		base = pci_epf_alloc_space(epf, INFER_BAR0_SIZE, BAR_0,
+					   align, PRIMARY_INTERFACE);
 		if (!base) {
 			dev_err(&epf->dev, "pci_epf_alloc_space BAR0 failed\n");
 			return -ENOMEM;

@@ -39,11 +39,10 @@
 
 | 文件 | 角色 | 装在哪 |
 | --- | --- | --- |
-| `pci_epf_infer.c` | EP function 驱动 | 每板的 EP 口（`73000000.pcie2_ep`） |
+| `pci_epf_infer.c` | EP function 驱动（`#include ../../controller/bst/pcie-bst.h`） | 每板的 EP 口（`73000000.pcie2_ep`） |
 | `infer_rc.c` | RC 主机驱动 | 每板的 RC 口（枚举到的 `0000:01:00.0`） |
 | `infer_proto.h` | 共享协议（magic / 寄存器布局 / ioctl） | 两边模块 + 用户态共用 |
 | `inferlat.c` | 用户态延迟扫表（4KB→2MB） | RC 侧用户态 |
-| `bst_doorbell.h` | 门铃 API 声明（进树编时优先用内核 `pcie-bst.h`） | 编译辅助 |
 | `install-into-kernel.sh` | 拷进内核树并编 `.ko` | 开发机 |
 
 设备 ID 故意用 **`1ef1:0301`**（不用 `0300`），避免和 `pci_epf_test` / `pci-endpoint-test` 冲突。

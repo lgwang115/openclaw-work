@@ -24,11 +24,10 @@
 
 ## 文件
 
-- `pci_epf_infer.c` — EP 侧 function 驱动
+- `pci_epf_infer.c` — EP 侧 function 驱动（进树编时 include 内核 `pcie-bst.h`）
 - `infer_rc.c` — RC 侧主机驱动
 - `inferlat.c` — 用户态延迟扫表（4KB→2MB）
 - `infer_proto.h` — 共享协议
-- `bst_doorbell.h` — 门铃 API 前向声明
 
 ## 编译
 

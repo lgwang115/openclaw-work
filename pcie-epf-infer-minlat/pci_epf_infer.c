@@ -359,8 +359,6 @@ static const struct pci_epc_event_ops epf_infer_event_ops = {
 
 static int epf_infer_bind(struct pci_epf *epf)
 {
-	struct epf_infer *ctx = epf_get_drvdata(epf);
-
 	/*
 	 * Do NOT program BARs here. Only attach event ops so core_init runs
 	 * at the correct time (when controller starts), matching pci_epf_test.

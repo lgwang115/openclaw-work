@@ -308,6 +308,17 @@ static int epf_infer_core_init(struct pci_epf *epf)
 	struct pci_epc *epc = epf->epc;
 	int ret;
 
+	/* Idempotent: safe if called from core_init and again from link_up */
+	if (ctx->regs) {
+		dev_info(&epf->dev, "core_init: already done, refresh magic/db\n");
+		WRITE_ONCE(ctx->regs->magic, INFER_MAGIC);
+		WRITE_ONCE(ctx->regs->db_bar, ctx->db_bar);
+		WRITE_ONCE(ctx->regs->db_offset, ctx->db_offset);
+		WRITE_ONCE(ctx->regs->db_msg, ctx->db_msg);
+		WRITE_ONCE(ctx->regs->status, INFER_STATUS_IDLE);
+		return 0;
+	}
+
 	dev_info(&epf->dev, "core_init: programming header/BAR/doorbell\n");
 
 	ret = pci_epc_write_header(epc, epf->func_no, epf->vfunc_no, epf->header);
@@ -320,7 +331,6 @@ static int epf_infer_core_init(struct pci_epf *epf)
 	if (ret)
 		return ret;
 
-	/* DMA can be set up once; safe in core_init */
 	if (!ctx->dma_ok) {
 		ret = epf_infer_setup_dma(ctx);
 		if (ret)
@@ -348,7 +358,16 @@ static int epf_infer_core_init(struct pci_epf *epf)
 
 static int epf_infer_link_up(struct pci_epf *epf)
 {
+	struct epf_infer *ctx = epf_get_drvdata(epf);
+
 	dev_info(&epf->dev, "link_up\n");
+	/*
+	 * BST may not invoke event_ops->core_init on start. Fall back here
+	 * so BARs are programmed after the controller is live (same window
+	 * where pci_epf_test historically ran set_bar).
+	 */
+	if (!ctx->regs)
+		return epf_infer_core_init(epf);
 	return 0;
 }
 
@@ -360,12 +379,11 @@ static const struct pci_epc_event_ops epf_infer_event_ops = {
 static int epf_infer_bind(struct pci_epf *epf)
 {
 	/*
-	 * Do NOT program BARs here. Only attach event ops so core_init runs
-	 * at the correct time (when controller starts), matching pci_epf_test.
+	 * event_ops already set in probe. If core_init still does not fire
+	 * on this BSP, try programming now; link_up will retry if wiped.
 	 */
-	epf->event_ops = &epf_infer_event_ops;
-	dev_info(&epf->dev, "bind: event_ops registered (wait for core_init)\n");
-	return 0;
+	dev_info(&epf->dev, "bind\n");
+	return epf_infer_core_init(epf);
 }
 
 static void epf_infer_unbind(struct pci_epf *epf)
@@ -386,7 +404,6 @@ static void epf_infer_unbind(struct pci_epf *epf)
 		ctx->regs = NULL;
 	}
 	epf_infer_cleanup_dma(ctx);
-	epf->event_ops = NULL;
 }
 
 static struct pci_epf_header epf_infer_header = {
@@ -411,7 +428,10 @@ static int epf_infer_probe(struct pci_epf *epf,
 	init_completion(&ctx->xfer_done);
 	INIT_WORK(&ctx->cmd_work, epf_infer_cmd_work);
 	epf->header = &epf_infer_header;
+	/* Register early so start/core_init can see it (pci_epf_test style). */
+	epf->event_ops = &epf_infer_event_ops;
 	epf_set_drvdata(epf, ctx);
+	dev_info(&epf->dev, "probe: event_ops ready\n");
 	return 0;
 }
 

@@ -29,6 +29,9 @@ v2 数据面命令以 **WRITE（远端读 → 本地写）** 为主；READ 仅�
 
 同缆 **单 outstanding**（EP `ctx->busy`）；多线程同缆需用户态串行化。双缆各自独立。
 
+**MoE / all-to-all：** 必须先 `POST_RECV` 再 `PUSH`（`post_recv` → `send` → `wait_recv`）。  
+双边同时阻塞在等 credit 的 `send()` 会 5s 死锁。详见 **`EP2_COMM.md`**。
+
 ## 3. 为什么 v1 不够
 
 v1：

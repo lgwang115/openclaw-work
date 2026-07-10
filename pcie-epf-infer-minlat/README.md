@@ -31,10 +31,12 @@
 - `inferlat.c` — v1 延迟扫表
 - `inferpush.c` — v2 staging smoke（POST_RECV STAGING）
 - `inferzc.c` — v2 零拷贝接口测试（MAP_USER + DMABUF）
+- `test_pcie_comm_ep2.c` — 双缆双向 EP2 通信层 smoke（post→send→wait）
 - `infer_dmabuf_test.c` — 测试用连续 dma-buf 导出（`/dev/infer_dmabuf_test`）
+- `ref/BstEpCommPcie.*` — MNN 通信层参考实现
 - `infer_proto.h` / `infer_proto_v2.h` — 协议
 - `install-into-kernel.sh` — 推荐编译入口
-- `ZEROCOPY.md` / `BRINGUP.md` / `BUILD.md` — 设计与板测
+- `ZEROCOPY.md` / `BRINGUP.md` / `BUILD.md` / **`EP2_COMM.md`** — 设计、板测、MoE 联调
 
 ## 编译
 
@@ -100,16 +102,18 @@ ls /dev/infer_rc0
 # 验收参考: 4KB 中位 ~17µs，2MB ~6 GB/s（见 BRINGUP.md）
 ```
 
-**测零拷贝接口（v2，可选）：**
+**测零拷贝 / EP2 通信层（v2）：**
 
 ```bash
-# 接收板
-./inferpush ep 0 4096
-# 或: insmod infer_dmabuf_test.ko && ./inferzc ep 0 4096
+# 单方向 staging
+# 接收板: ./inferpush ep 0 4096
+# 发送板: ./inferpush rc 0 4096
 
-# 发送板
-./inferpush rc 0 4096
-# 或: ./inferzc rc 0 4096 / ./inferzc rc-dmabuf 0 4096
+# 双缆双向（两板同时跑；MoE 前先过这一关）
+# B rank0: ./test_pcie_comm_ep2 0 /dev/infer_rc0
+# A rank1: ./test_pcie_comm_ep2 1 /dev/infer_rc0
+
+# 详见 EP2_COMM.md（MoE not POSTED / WAIT -5/-110 排查）
 ```
 
 ## 关键路径时序

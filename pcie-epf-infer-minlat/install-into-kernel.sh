@@ -67,25 +67,27 @@ echo "==> Build userspace tools"
 "${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/inferlat" "$SRC/inferlat.c"
 "${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/inferpush" "$SRC/inferpush.c"
 "${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/inferzc" "$SRC/inferzc.c"
+"${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/test_pcie_comm_ep2" "$SRC/test_pcie_comm_ep2.c"
 
 echo
 echo "DONE. Artifacts:"
 ls -l "$EP_DIR/pci_epf_infer.ko" "$MISC_DIR/infer_rc.ko" \
 	"$MISC_DIR/infer_dmabuf_test.ko" \
-	"$SRC/inferlat" "$SRC/inferpush" "$SRC/inferzc"
+	"$SRC/inferlat" "$SRC/inferpush" "$SRC/inferzc" "$SRC/test_pcie_comm_ep2"
 echo
 echo "Copy to BOTH boards:"
 echo "  for IP in <A_IP> <B_IP>; do"
 echo "    scp $EP_DIR/pci_epf_infer.ko $MISC_DIR/infer_rc.ko \\"
 echo "        $MISC_DIR/infer_dmabuf_test.ko \\"
-echo "        $SRC/inferlat $SRC/inferpush $SRC/inferzc \\"
+echo "        $SRC/inferlat $SRC/inferpush $SRC/inferzc $SRC/test_pcie_comm_ep2 \\"
 echo "        root@\$IP:/userdata/ep_test/"
 echo "  done"
 echo
 echo "Tests:"
 echo "  v1 latency:  ./inferlat /dev/infer_rc0 w 100"
 echo "  v2 staging:  EP ./inferpush ep 0 4096 ; RC ./inferpush rc 0 4096"
+echo "  v2 bidir:    ./test_pcie_comm_ep2 0 /dev/infer_rc0   # other board: rank 1"
 echo "  v2 zc path:  EP: insmod infer_dmabuf_test.ko && ./inferzc ep 0 4096"
 echo "               RC: ./inferzc rc 0 4096            # MAP_USER"
 echo "               RC: ./inferzc rc-dmabuf 0 4096     # MAP_DMABUF (also needs infer_dmabuf_test.ko)"
-echo "See ZEROCOPY.md / BRINGUP.md."
+echo "See ZEROCOPY.md / BRINGUP.md / EP2_COMM.md."

@@ -159,27 +159,19 @@ static void epf_infer_finish_locked(struct epf_infer *ctx, int ret)
 	struct epf_infer_slot *slot;
 	u32 seq;
 
-	/*
-	 * Only mutate slot state if we had accepted the PUSH (BUSY).
-	 * Rejecting a PUSH while EMPTY/POSTED must NOT poison the slot to
-	 * ERROR — that made a later WAIT return -EIO (-5) even after a
-	 * fresh POST_RECV race, and confused MoE EP2 bring-up.
-	 */
 	if (ctx->pend_cmd == INFER_CMD_PUSH &&
 	    ctx->pend_slot < INFER_V2_SLOTS) {
 		slot = &ctx->slots[ctx->pend_slot];
-		if (slot->state == INFER_SLOT_BUSY) {
-			if (ret) {
-				slot->state = INFER_SLOT_ERROR;
-			} else {
-				seq = READ_ONCE(regs->seq) + 1;
-				WRITE_ONCE(regs->seq, seq);
-				slot->xfer_size = ctx->pend_size;
-				slot->seq = seq;
-				slot->state = INFER_SLOT_DONE;
-			}
-			epf_infer_update_credit_locked(ctx);
+		if (ret) {
+			slot->state = INFER_SLOT_ERROR;
+		} else {
+			seq = READ_ONCE(regs->seq) + 1;
+			WRITE_ONCE(regs->seq, seq);
+			slot->xfer_size = ctx->pend_size;
+			slot->seq = seq;
+			slot->state = INFER_SLOT_DONE;
 		}
+		epf_infer_update_credit_locked(ctx);
 	}
 
 	wmb();
@@ -274,37 +266,19 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 
 	case INFER_CMD_PUSH:
 		if (slot_idx >= INFER_V2_SLOTS || !size) {
-			dev_warn_ratelimited(&ctx->epf->dev,
-				"PUSH reject: bad slot=%u size=%u\n",
-				slot_idx, size);
 			epf_infer_finish_locked(ctx, -EINVAL);
 			spin_unlock_irqrestore(&ctx->lock, flags);
 			return IRQ_HANDLED;
 		}
 		slot = &ctx->slots[slot_idx];
 		if (slot->state != INFER_SLOT_POSTED) {
-			/*
-			 * Peer PUSH before local POST_RECV (or after WAIT
-			 * already consumed DONE). Fail RC status only —
-			 * leave slot state alone so a later POST_RECV works.
-			 */
-			dev_warn_ratelimited(&ctx->epf->dev,
-				"PUSH reject: slot %u state=%u (need POSTED) size=%u\n",
-				slot_idx, slot->state, size);
-			epf_infer_finish_locked(ctx, -ENOENT);
+			epf_infer_finish_locked(ctx, -EINVAL);
 			spin_unlock_irqrestore(&ctx->lock, flags);
 			return IRQ_HANDLED;
 		}
 		if (size > slot->capacity) {
-			dev_warn_ratelimited(&ctx->epf->dev,
-				"PUSH reject: slot %u size=%u > capacity=%zu\n",
-				slot_idx, size, slot->capacity);
-			/* Accepted POSTED → mark ERROR so WAIT wakes with -EIO */
-			slot->state = INFER_SLOT_BUSY;
-			epf_infer_update_credit_locked(ctx);
 			epf_infer_finish_locked(ctx, -EMSGSIZE);
 			spin_unlock_irqrestore(&ctx->lock, flags);
-			wake_up_interruptible(&ctx->slot_wq);
 			return IRQ_HANDLED;
 		}
 		local = slot->local_dst;

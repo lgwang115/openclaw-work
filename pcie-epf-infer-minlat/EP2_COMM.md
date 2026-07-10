@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | `send: slot 0 not POSTED after 5s` | 本地 credit 轮询超时 | 对端 EP **还没** `POST_RECV`，`posted_mask` bit0=0 |
 | `send PUSH failed result=-5` | `-EIO` | RC 看到 BAR1 `status=FAIL`（对端拒收或 DMA 失败） |
-| `recv WAIT failed result=-5` | `-EIO` | EP slot 已是 **ERROR**（旧驱动：未 POSTED 的 PUSH 会**毒化** slot） |
+| `recv WAIT failed result=-5` | `-EIO` | EP slot 已是 **ERROR**（未 POSTED 的 PUSH / capacity 不够 / DMA 失败） |
 | `recv WAIT failed result=-110` | `-ETIMEDOUT` | 一直等不到 DONE（对端没成功 PUSH） |
 
 你这次双板日志的典型时间线：
@@ -67,12 +67,12 @@ for peer: wait_recv(peer, buf, size)
 
 因此同一时刻只能有一包 in-flight。MoE 若对同一 peer 重叠多次 `send`/`recv`，或未等 WAIT 完成就下一包，会乱。
 
-### 根因 C（驱动 bug，已修）：未 POSTED 的 PUSH 毒化 slot
+### 根因 C（驱动行为）：未 POSTED 的 PUSH 会把 slot 标成 ERROR
 
-旧逻辑：门铃收到 `PUSH` 但 slot≠POSTED 时，仍把 slot 标成 **ERROR**。  
-随后本地 `WAIT` 立刻 `-EIO`（日志里的 `result=-5`），即使之后重新 `POST_RECV` 也可能和失败 PUSH 竞态。
+当前逻辑：门铃收到 `PUSH` 但 slot≠POSTED 时，仍把 slot 标成 **ERROR** 并给 RC 写 `status=FAIL`。  
+随后本地若已在 `WAIT`，会立刻得到 `-EIO`（日志里的 `result=-5`）。
 
-**已修复**（本目录 `pci_epf_infer.c`）：拒收未 POSTED 的 PUSH 时 **只** 给 RC 写 `status=FAIL`，**不改** slot 状态；并打 `dmesg` 警告。请重新 `install-into-kernel.sh` 后换板子上的 `pci_epf_infer.ko`。
+这不是主因（主因仍是两边先 `send` 等 credit），但会放大竞态下的 `-5`。优先把上层改成 `post_recv → send → wait_recv`。
 
 ### 根因 D：`POST_RECV.capacity` < `PUSH.size`
 

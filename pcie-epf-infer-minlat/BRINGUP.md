@@ -409,6 +409,20 @@ EP 驱动累积每次 eDMA 的 **submit→完成回调** 时间（零逐包 `pri
 
 或加载时开周期性 dmesg 汇总：`insmod pci_epf_infer.ko dma_log_every=1000`。
 
+**零拷贝 4K dma-buf 计时**（`inferzc` 带 `iters`，两板同 N）：
+
+```bash
+# EP 板
+insmod ./infer_dmabuf_test.ko
+./inferdmastat reset
+./inferzc ep 0 4096 1000            # POST_RECV/WAIT dma-buf ×1000
+# RC 板（EP 起来后）
+insmod ./infer_dmabuf_test.ko
+./inferzc rc-dmabuf 0 4096 1000     # MAP_DMABUF + PUSH ×1000
+# EP 板
+./inferdmastat                       # 4K dma-buf 的 min/avg/max eDMA 时间
+```
+
 测的是 `submit→回调`（含 eDMA 排队 + 搬运 + 完成中断→回调调度），是 RC 端到端 `lat_ns` 的**子集**；  
 `RC 端到端 − eDMA avg ≈ 门铃 IRQ + status 写回/轮询开销`。
 

@@ -8,13 +8,20 @@
  *
  * EP board (start first):
  *   insmod infer_dmabuf_test.ko
- *   ./inferzc ep [slot] [size]
+ *   ./inferzc ep [slot] [size] [iters]
  *
  * RC board:
  *   ./inferzc rc [slot] [size]
  *   # or full dmabuf↔dmabuf:
  *   insmod infer_dmabuf_test.ko
- *   ./inferzc rc-dmabuf [slot] [size]
+ *   ./inferzc rc-dmabuf [slot] [size] [iters]
+ *
+ * iters (ep / rc-dmabuf, default 1): repeat POST_RECV/PUSH N times so the
+ * EP-side eDMA stats (inferdmastat) accumulate real min/avg/max. Run the same
+ * iters on both boards. Example, 4K dma-buf timing:
+ *   EP: ./inferdmastat reset ; ./inferzc ep 0 4096 1000
+ *   RC: ./inferzc rc-dmabuf 0 4096 1000
+ *   EP: ./inferdmastat
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +61,7 @@ static int check_pattern(const uint8_t *p, uint32_t size)
 	return bad ? -1 : 0;
 }
 
-static int do_ep(int slot, uint32_t size)
+static int do_ep(int slot, uint32_t size, int iters)
 {
 	struct infer_dmabuf_export exp = { .size = size };
 	struct infer_ep_recv_reg post = {
@@ -63,9 +70,9 @@ static int do_ep(int slot, uint32_t size)
 		.capacity = size,
 		.dmabuf_fd = -1,
 	};
-	struct infer_ep_wait w = { .slot = slot, .timeout_us = 60000000 };
 	struct infer_ep_info info = {};
-	int dfd = -1, efd = -1, ret = 1;
+	int dfd = -1, efd = -1, ret = 1, i;
+	int bad_iters = 0;
 	void *map = MAP_FAILED;
 	size_t map_size = 0;
 
@@ -78,8 +85,8 @@ static int do_ep(int slot, uint32_t size)
 		perror("DMABUF EXPORT");
 		goto out;
 	}
-	printf("EP exported dmabuf fd=%d size=%llu\n",
-	       exp.fd, (unsigned long long)exp.size);
+	printf("EP exported dmabuf fd=%d size=%llu iters=%d\n",
+	       exp.fd, (unsigned long long)exp.size, iters);
 	map_size = exp.size;
 	post.dmabuf_fd = exp.fd;
 
@@ -96,25 +103,35 @@ static int do_ep(int slot, uint32_t size)
 		perror("mmap dmabuf");
 		goto out;
 	}
-	memset(map, 0, size);
 
-	if (ioctl(efd, INFER_EP_IOC_POST_RECV, &post) < 0) {
-		perror("POST_RECV(DMABUF)");
-		goto out;
-	}
-	printf("EP POST_RECV DMABUF slot=%d — waiting (60s)...\n", slot);
+	printf("EP POST_RECV DMABUF slot=%d — waiting for %d PUSH (first up to 60s)...\n",
+	       slot, iters);
 
-	ret = ioctl(efd, INFER_EP_IOC_WAIT, &w);
-	printf("WAIT result=%d size=%u seq=%u\n", ret, w.size, w.seq);
-	if (ret) {
-		ret = 1;
-		goto out;
+	for (i = 0; i < iters; i++) {
+		struct infer_ep_wait w = {
+			.slot = slot,
+			/* first iter waits long for the RC to start; rest short */
+			.timeout_us = (i == 0) ? 60000000 : 5000000,
+		};
+
+		memset(map, 0, size);
+		if (ioctl(efd, INFER_EP_IOC_POST_RECV, &post) < 0) {
+			perror("POST_RECV(DMABUF)");
+			goto out;
+		}
+		if (ioctl(efd, INFER_EP_IOC_WAIT, &w) != 0) {
+			fprintf(stderr, "WAIT[%d] failed result=%d\n", i, w.result);
+			goto out;
+		}
+		if (check_pattern(map, w.size ? w.size : size) != 0)
+			bad_iters++;
 	}
-	if (check_pattern(map, w.size ? w.size : size) == 0) {
-		printf("payload OK via EP DMABUF\n");
+
+	if (bad_iters == 0) {
+		printf("payload OK via EP DMABUF x%d\n", iters);
 		ret = 0;
 	} else {
-		fprintf(stderr, "payload MISMATCH\n");
+		fprintf(stderr, "payload MISMATCH in %d/%d iters\n", bad_iters, iters);
 		ret = 1;
 	}
 out:
@@ -142,6 +159,38 @@ static int rc_push(int fd, int slot, uint32_t size, uint64_t pci_addr)
 	printf("PUSH result=%d latency_ns=%llu\n",
 	       ret, (unsigned long long)p.timeout_us);
 	return ret ? 1 : 0;
+}
+
+/* Wait until EP marks the slot POSTED (credit), then PUSH once. Quiet. */
+static int rc_push_when_posted(int fd, int slot, uint32_t size, uint64_t pci_addr)
+{
+	struct infer_credit cr;
+	const uint32_t slot_bit = (1u << slot);
+	int n = 0;
+
+	do {
+		if (ioctl(fd, INFER_IOC_GET_CREDIT, &cr) == 0 &&
+		    (cr.posted_mask & slot_bit))
+			break;
+		usleep(100);
+	} while (++n < 50000);  /* 5s */
+	if (n >= 50000) {
+		fprintf(stderr, "slot %d not POSTED after 5s (posted=0x%x)\n",
+			slot, cr.posted_mask);
+		return 1;
+	}
+
+	struct infer_push p = {
+		.slot = slot,
+		.size = size,
+		.pci_addr = pci_addr,
+		.timeout_us = 5000000,
+	};
+	if (ioctl(fd, INFER_IOC_PUSH, &p) != 0 || p.result != 0) {
+		fprintf(stderr, "PUSH result=%d\n", p.result);
+		return 1;
+	}
+	return 0;
 }
 
 static int do_rc_user(int slot, uint32_t size)
@@ -205,12 +254,12 @@ out:
 	return ret;
 }
 
-static int do_rc_dmabuf(int slot, uint32_t size)
+static int do_rc_dmabuf(int slot, uint32_t size, int iters)
 {
 	struct infer_dmabuf_export exp = { .size = size };
 	struct infer_map_dmabuf md = { .dmabuf_fd = -1, .size = size };
 	struct infer_credit cr;
-	int dfd = -1, fd = -1, ret = 1;
+	int dfd = -1, fd = -1, ret = 1, i;
 	void *map = MAP_FAILED;
 	__u64 pci = 0;
 
@@ -223,8 +272,8 @@ static int do_rc_dmabuf(int slot, uint32_t size)
 		perror("DMABUF EXPORT");
 		goto out;
 	}
-	printf("RC exported dmabuf fd=%d size=%llu\n",
-	       exp.fd, (unsigned long long)exp.size);
+	printf("RC exported dmabuf fd=%d size=%llu iters=%d\n",
+	       exp.fd, (unsigned long long)exp.size, iters);
 
 	map = mmap(NULL, exp.size, PROT_READ | PROT_WRITE, MAP_SHARED, exp.fd, 0);
 	if (map == MAP_FAILED) {
@@ -252,7 +301,18 @@ static int do_rc_dmabuf(int slot, uint32_t size)
 	printf("MAP_DMABUF -> pci_addr=0x%llx size=%llu\n",
 	       (unsigned long long)pci, (unsigned long long)md.size);
 
-	ret = rc_push(fd, slot, size, pci);
+	ret = 0;
+	for (i = 0; i < iters; i++) {
+		if (rc_push_when_posted(fd, slot, size, pci)) {
+			fprintf(stderr, "PUSH[%d] failed\n", i);
+			ret = 1;
+			break;
+		}
+	}
+	if (ret == 0)
+		printf("PUSH x%d OK — read EP-side timing with ./inferdmastat\n",
+		       iters);
+
 	if (ioctl(fd, INFER_IOC_UNMAP_DMABUF, &pci) < 0)
 		perror("UNMAP_DMABUF");
 out:
@@ -272,10 +332,13 @@ int main(int argc, char **argv)
 	const char *mode;
 	int slot = 0;
 	uint32_t size = 4096;
+	int iters = 1;
 
 	if (argc < 2) {
 		fprintf(stderr,
-			"usage: %s ep|rc|rc-dmabuf [slot] [size]\n", argv[0]);
+			"usage: %s ep|rc|rc-dmabuf [slot] [size] [iters]\n"
+			"  iters (ep/rc-dmabuf, default 1): repeat for eDMA stats\n",
+			argv[0]);
 		return 1;
 	}
 	mode = argv[1];
@@ -283,13 +346,17 @@ int main(int argc, char **argv)
 		slot = atoi(argv[2]);
 	if (argc >= 4)
 		size = (uint32_t)atoi(argv[3]);
+	if (argc >= 5)
+		iters = atoi(argv[4]);
+	if (iters < 1)
+		iters = 1;
 
 	if (!strcmp(mode, "ep"))
-		return do_ep(slot, size);
+		return do_ep(slot, size, iters);
 	if (!strcmp(mode, "rc"))
 		return do_rc_user(slot, size);
 	if (!strcmp(mode, "rc-dmabuf"))
-		return do_rc_dmabuf(slot, size);
+		return do_rc_dmabuf(slot, size, iters);
 	fprintf(stderr, "mode must be ep|rc|rc-dmabuf\n");
 	return 1;
 }

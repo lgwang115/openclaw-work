@@ -71,6 +71,19 @@ int main(int argc, char **argv)
 	printf("  %-28s min=%.2f  avg=%.2f  max=%.2f µs  (~%.2f GB/s)\n",
 	       "xfer (issue->cb):",
 	       s.min_ns / 1000.0, xfer_avg, s.max_ns / 1000.0, gbps);
+	if (s.hwdone_count > 0) {
+		double hn = (double)s.hwdone_count;
+		double hw_avg = s.hwdone_sum_ns / hn / 1000.0;
+
+		printf("    %-26s min=%.2f  avg=%.2f  max=%.2f µs  (n=%llu)\n",
+		       "├ issue->HW done (poll):",
+		       s.hwdone_min_ns / 1000.0, hw_avg, s.hwdone_max_ns / 1000.0,
+		       (unsigned long long)s.hwdone_count);
+		printf("    %-26s avg=%.2f µs  (xfer avg - HW done avg)\n",
+		       "└ HW done->callback:", xfer_avg - hw_avg);
+	} else {
+		printf("    (HW-done split off; insmod with dma_poll_diag=N to enable)\n");
+	}
 	printf("  %-28s min=%.2f  avg=%.2f  max=%.2f µs\n",
 	       "EP total (handler->cb):",
 	       s.total_min_ns / 1000.0, s.total_sum_ns / n / 1000.0,

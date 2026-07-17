@@ -439,6 +439,21 @@ EP-internal breakdown  n=1000  size=4096 B/xfer
   EP total (handler->cb):      min=.. avg=.. max=.. µs   # EP 内部总时长
 ```
 
+**诊断:拆开 `xfer` = 搬运 vs 完成回调派发**
+
+想知道 12µs 的 `xfer` 里硬件搬运占多少、回调派发占多少,加载时开 `dma_poll_diag`（值=最多轮询多少 µs）:
+
+```bash
+insmod ./pci_epf_infer.ko dma_poll_diag=60
+# 然后照常 ./inferdmastat reset → 跑测试 → ./inferdmastat
+#   xfer (issue->cb):        avg=12.x µs
+#     ├ issue->HW done (poll): avg=?.? µs   # 硬件真正搬完
+#     └ HW done->callback:     avg=?.? µs   # 完成中断→回调派发(RT 软中断)
+```
+
+若 `issue->HW done` ≈ 2µs、`HW done->callback` ≈ 10µs → 坐实是回调派发慢,做 Tier 1（轮询完成）能砍掉这 10µs。  
+`dma_poll_diag` 只在门铃 handler 里有限轮询打时间戳,不改完成路径,默认 0=关。
+
 口径说明:
 
 - `setup`（slave_config + prep_slave_single）就是"5µs gap"里那段,**现在可精确读**。

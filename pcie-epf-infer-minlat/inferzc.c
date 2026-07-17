@@ -161,8 +161,13 @@ static int rc_push(int fd, int slot, uint32_t size, uint64_t pci_addr)
 	return ret ? 1 : 0;
 }
 
-/* Wait until EP marks the slot POSTED (credit), then PUSH once. Quiet. */
-static int rc_push_when_posted(int fd, int slot, uint32_t size, uint64_t pci_addr)
+/*
+ * Wait until EP marks the slot POSTED (credit), then PUSH once. Quiet.
+ * On success, *lat_ns gets this transfer's end-to-end time (doorbell → status
+ * OK), as measured by the RC driver (infer_poll_status).
+ */
+static int rc_push_when_posted(int fd, int slot, uint32_t size,
+			       uint64_t pci_addr, uint64_t *lat_ns)
 {
 	struct infer_credit cr;
 	const uint32_t slot_bit = (1u << slot);
@@ -190,7 +195,40 @@ static int rc_push_when_posted(int fd, int slot, uint32_t size, uint64_t pci_add
 		fprintf(stderr, "PUSH result=%d\n", p.result);
 		return 1;
 	}
+	if (lat_ns)
+		*lat_ns = p.timeout_us;  /* driver writes lat_ns back here */
 	return 0;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return (x > y) - (x < y);
+}
+
+/* Print min/median/avg/p99/max over per-iteration end-to-end times (ns). */
+static void print_lat_stats(const char *tag, uint64_t *v, int n, uint32_t size)
+{
+	uint64_t sum = 0;
+	double avg_us, med_us, p99_us, min_us, max_us, gbps;
+	int i;
+
+	if (n <= 0)
+		return;
+	for (i = 0; i < n; i++)
+		sum += v[i];
+	qsort(v, n, sizeof(v[0]), cmp_u64);
+
+	min_us = v[0] / 1000.0;
+	max_us = v[n - 1] / 1000.0;
+	med_us = v[n / 2] / 1000.0;
+	p99_us = v[(int)(n * 0.99) < n ? (int)(n * 0.99) : n - 1] / 1000.0;
+	avg_us = (double)sum / n / 1000.0;
+	gbps = avg_us > 0 ? (double)size / avg_us / 1000.0 : 0.0;
+
+	printf("%s n=%d size=%uB  min=%.2f  median=%.2f  avg=%.2f  p99=%.2f  max=%.2f µs  (~%.2f GB/s)\n",
+	       tag, n, size, min_us, med_us, avg_us, p99_us, max_us, gbps);
 }
 
 static int do_rc_user(int slot, uint32_t size)
@@ -301,17 +339,31 @@ static int do_rc_dmabuf(int slot, uint32_t size, int iters)
 	printf("MAP_DMABUF -> pci_addr=0x%llx size=%llu\n",
 	       (unsigned long long)pci, (unsigned long long)md.size);
 
+	uint64_t *lat = calloc(iters, sizeof(uint64_t));
+
+	if (!lat) {
+		perror("calloc");
+		goto out;
+	}
+
 	ret = 0;
 	for (i = 0; i < iters; i++) {
-		if (rc_push_when_posted(fd, slot, size, pci)) {
+		uint64_t l = 0;
+
+		if (rc_push_when_posted(fd, slot, size, pci, &l)) {
 			fprintf(stderr, "PUSH[%d] failed\n", i);
 			ret = 1;
 			break;
 		}
+		lat[i] = l;
+		if (iters <= 20)
+			printf("  iter %d: total %.2f µs\n", i, l / 1000.0);
 	}
-	if (ret == 0)
-		printf("PUSH x%d OK — read EP-side timing with ./inferdmastat\n",
-		       iters);
+	if (ret == 0) {
+		print_lat_stats("RC total(doorbell→status):", lat, iters, size);
+		printf("PUSH x%d OK — EP-side eDMA time: ./inferdmastat\n", iters);
+	}
+	free(lat);
 
 	if (ioctl(fd, INFER_IOC_UNMAP_DMABUF, &pci) < 0)
 		perror("UNMAP_DMABUF");

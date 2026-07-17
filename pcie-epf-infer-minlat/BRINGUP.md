@@ -419,9 +419,15 @@ insmod ./infer_dmabuf_test.ko
 # RC 板（EP 起来后）
 insmod ./infer_dmabuf_test.ko
 ./inferzc rc-dmabuf 0 4096 1000     # MAP_DMABUF + PUSH ×1000
+# RC 侧结尾自动打印每次总用时统计：
+#   RC total(doorbell→status): n=1000 size=4096B min=.. median=.. avg=.. p99=.. max=.. µs (~.. GB/s)
 # EP 板
 ./inferdmastat                       # 4K dma-buf 的 min/avg/max eDMA 时间
 ```
+
+两处口径：`inferzc rc-dmabuf` 的 `RC total` 是**每次端到端**（门铃→status，含 eDMA + 门铃 + 轮询）；  
+`inferdmastat` 是同一批传输里 **EP eDMA submit→回调** 那段。两者相减≈门铃 IRQ + status 开销。  
+`iters ≤ 20` 时还会逐次打印 `iter i: total .. µs`。
 
 测的是 `submit→回调`（含 eDMA 排队 + 搬运 + 完成中断→回调调度），是 RC 端到端 `lat_ns` 的**子集**；  
 `RC 端到端 − eDMA avg ≈ 门铃 IRQ + status 写回/轮询开销`。

@@ -393,6 +393,25 @@ cd /userdata/ep_test
 
 4KB 中位约 **24µs**，2MB 约 **6.2 GB/s**。去掉 workqueue 后小包约再降 **7µs**。
 
+### 拆解延迟：EP 侧 eDMA 计时（`inferdmastat`）
+
+EP 驱动累积每次 eDMA 的 **submit→完成回调** 时间（零逐包 `printk`），用来看 ~17µs 里 DMA 占多少：
+
+```bash
+# EP 板
+./inferdmastat reset
+# RC 板：跑 inferlat / inferpush / test_pcie_comm_ep2
+./inferlat /dev/infer_rc0 w 100
+# EP 板
+./inferdmastat
+# eDMA submit->cb: n=... min=.. avg=.. max=.. last=..  ~avg_rate=.. GB/s
+```
+
+或加载时开周期性 dmesg 汇总：`insmod pci_epf_infer.ko dma_log_every=1000`。
+
+测的是 `submit→回调`（含 eDMA 排队 + 搬运 + 完成中断→回调调度），是 RC 端到端 `lat_ns` 的**子集**；  
+`RC 端到端 − eDMA avg ≈ 门铃 IRQ + status 写回/轮询开销`。
+
 ### v2 零拷贝 smoke（单次冷启动，非中位）
 
 | 路径 | 结果 | 单次 latency |

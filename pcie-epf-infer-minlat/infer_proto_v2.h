@@ -158,4 +158,26 @@ struct infer_ep_info {
 
 #define INFER_EP_IOC_GET_INFO       _IOR(INFER_EP_IOC_MAGIC, 5, struct infer_ep_info)
 
+/*
+ * EP-side eDMA timing stats (submit → completion callback), accumulated in
+ * the driver with zero per-transfer printk. Reading with INFER_EP_IOC_DMA_STATS
+ * returns the current counters and, if reset != 0, clears them afterwards.
+ *
+ * Measures submit→callback: eDMA queue + transfer + completion-IRQ→callback
+ * dispatch. It is a subset of the RC end-to-end latency (infer_poll_status),
+ * so RC_end_to_end - dma_avg ≈ doorbell IRQ + status write/poll overhead.
+ */
+struct infer_ep_dma_stats {
+	__u32 reset;          /* in: nonzero => zero counters after reading */
+	__u32 pad;
+	__u64 count;          /* completed DMAs since last reset */
+	__u64 sum_ns;         /* sum of submit→cb durations */
+	__u64 min_ns;
+	__u64 max_ns;
+	__u64 last_ns;
+	__u64 bytes;          /* total bytes moved */
+};
+
+#define INFER_EP_IOC_DMA_STATS      _IOWR(INFER_EP_IOC_MAGIC, 6, struct infer_ep_dma_stats)
+
 #endif /* _INFER_PROTO_V2_H_ */

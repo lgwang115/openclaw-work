@@ -32,6 +32,7 @@
 - `inferpush.c` — v2 staging smoke（POST_RECV STAGING）
 - `inferzc.c` — v2 零拷贝接口测试（MAP_USER + DMABUF）
 - `test_pcie_comm_ep2.c` — 双缆双向 EP2 通信层 smoke（post→send→wait）
+- `inferdmastat.c` — 读 EP 侧 eDMA submit→回调 计时（拆解端到端延迟）
 - `infer_dmabuf_test.c` — 测试用连续 dma-buf 导出（`/dev/infer_dmabuf_test`）
 - `ref/BstEpCommPcie.*` — MNN 通信层参考实现
 - `infer_proto.h` / `infer_proto_v2.h` — 协议

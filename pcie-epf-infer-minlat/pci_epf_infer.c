@@ -25,11 +25,22 @@
 #include <linux/wait.h>
 #include <linux/sched.h>
 #include <linux/scatterlist.h>
+#include <linux/ktime.h>
 
 #include "infer_proto_v2.h"
 #include "../../controller/bst/pcie-bst.h"
 
 #define DRV_NAME "pci_epf_infer"
+
+/*
+ * Per-N-transfer summary of eDMA submit→callback timing. 0 = off (default).
+ * Keep the hot path printk-free: only one dev_info per dma_log_every DMAs.
+ * Exact counters are always readable via INFER_EP_IOC_DMA_STATS.
+ */
+static unsigned int dma_log_every;
+module_param(dma_log_every, uint, 0644);
+MODULE_PARM_DESC(dma_log_every,
+	"log an eDMA timing summary every N completed transfers (0=off)");
 
 struct epf_infer_slot {
 	dma_addr_t		local_dst;
@@ -65,6 +76,15 @@ struct epf_infer {
 	u32			pend_cmd;
 	u32			pend_slot;
 	u32			pend_size;
+	/* eDMA timing stats (submit → completion callback), protected by lock */
+	u64			dma_t0_ns;    /* submit timestamp of in-flight DMA */
+	size_t			dma_cur_bytes;
+	u64			dma_count;
+	u64			dma_sum_ns;
+	u64			dma_min_ns;
+	u64			dma_max_ns;
+	u64			dma_last_ns;
+	u64			dma_bytes;
 	struct epf_infer_slot	slots[INFER_V2_SLOTS];
 	wait_queue_head_t	slot_wq;
 	struct miscdevice	ep_misc;
@@ -149,8 +169,44 @@ static int epf_infer_dma_submit(struct epf_infer *ctx,
 	if (dma_submit_error(cookie))
 		return -EIO;
 	ctx->cur_cookie = cookie;
+	/*
+	 * Timestamp right before issuing so the interval captures the eDMA
+	 * engine + transfer + completion-callback dispatch. Single-outstanding
+	 * (ctx->busy) means no other DMA can overwrite these before the cb.
+	 */
+	ctx->dma_cur_bytes = size;
+	ctx->dma_t0_ns = ktime_get_ns();
 	dma_async_issue_pending(chan);
 	return 0;
+}
+
+/* Accumulate one submit→callback interval. Caller holds ctx->lock. */
+static void epf_infer_dma_account_locked(struct epf_infer *ctx)
+{
+	u64 dt;
+
+	if (!ctx->dma_t0_ns)
+		return;
+	dt = ktime_get_ns() - ctx->dma_t0_ns;
+	ctx->dma_t0_ns = 0;
+
+	if (ctx->dma_count == 0 || dt < ctx->dma_min_ns)
+		ctx->dma_min_ns = dt;
+	if (dt > ctx->dma_max_ns)
+		ctx->dma_max_ns = dt;
+	ctx->dma_sum_ns += dt;
+	ctx->dma_last_ns = dt;
+	ctx->dma_bytes += ctx->dma_cur_bytes;
+	ctx->dma_count++;
+
+	if (dma_log_every && (ctx->dma_count % dma_log_every) == 0) {
+		u64 avg = ctx->dma_sum_ns / ctx->dma_count;
+
+		dev_info(&ctx->epf->dev,
+			 "eDMA n=%llu last=%lluns min=%lluns max=%lluns avg=%lluns (last %zuB)\n",
+			 ctx->dma_count, ctx->dma_last_ns, ctx->dma_min_ns,
+			 ctx->dma_max_ns, avg, ctx->dma_cur_bytes);
+	}
 }
 
 static void epf_infer_finish_locked(struct epf_infer *ctx, int ret)
@@ -194,6 +250,7 @@ static void epf_infer_dma_cb(void *param)
 		ret = -EIO;
 
 	spin_lock_irqsave(&ctx->lock, flags);
+	epf_infer_dma_account_locked(ctx);
 	epf_infer_finish_locked(ctx, ret);
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
@@ -860,6 +917,35 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 					INFER_EP_F_MULTI_SLOT |
 					INFER_EP_F_DMABUF;
 		if (copy_to_user(uarg, &info, sizeof(info)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case INFER_EP_IOC_DMA_STATS: {
+		struct infer_ep_dma_stats stats = {};
+		u32 reset;
+
+		if (copy_from_user(&reset, uarg, sizeof(reset)))
+			return -EFAULT;
+
+		spin_lock_irqsave(&ctx->lock, flags);
+		stats.count = ctx->dma_count;
+		stats.sum_ns = ctx->dma_sum_ns;
+		stats.min_ns = ctx->dma_count ? ctx->dma_min_ns : 0;
+		stats.max_ns = ctx->dma_max_ns;
+		stats.last_ns = ctx->dma_last_ns;
+		stats.bytes = ctx->dma_bytes;
+		if (reset) {
+			ctx->dma_count = 0;
+			ctx->dma_sum_ns = 0;
+			ctx->dma_min_ns = 0;
+			ctx->dma_max_ns = 0;
+			ctx->dma_last_ns = 0;
+			ctx->dma_bytes = 0;
+		}
+		spin_unlock_irqrestore(&ctx->lock, flags);
+
+		if (copy_to_user(uarg, &stats, sizeof(stats)))
 			return -EFAULT;
 		return 0;
 	}

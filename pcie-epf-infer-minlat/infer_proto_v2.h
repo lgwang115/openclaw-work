@@ -165,8 +165,10 @@ struct infer_ep_info {
  * HDMA register block base (i.e. BAR0 + 0x4000).
  * ===================================================================== */
 
-/* BST target0 layout (BAR0): doorbell @ 0xE00, HDMA regs @ 0x4000 */
-#define BST_TRGT0_HDMA_BASE         0x4000u
+/* BST target0 layout (BAR0): doorbell @ 0xE00, HDMA regs @ 0x4000.
+ * Named INFER_* to avoid clashing with BST_TRGT0_HDMA_BASE in pcie-bst.h,
+ * which pci_epf_infer.c also includes. */
+#define INFER_HDMA_BASE             0x4000u
 
 /* dw-hdma-v0 per-channel block */
 #define HDMA_V0_CH_STRIDE           0x200u   /* channel i base = i*0x200 */

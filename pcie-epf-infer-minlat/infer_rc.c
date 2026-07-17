@@ -54,6 +54,9 @@ struct infer_rc {
 	void __iomem		*ctrl;
 	resource_size_t		ctrl_len;
 	void __iomem		*db_iomem;
+	void __iomem		*db_bar_base; /* full BAR0 map (doorbell+HDMA live here) */
+	void __iomem		*hdma_iomem;  /* db_bar_base + BST_TRGT0_HDMA_BASE */
+	size_t			hdma_len;     /* bytes mapped from HDMA base to BAR end */
 	void			*buf;
 	dma_addr_t		buf_dma;
 	size_t			buf_size;
@@ -519,6 +522,23 @@ static long infer_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 		return 0;
 
+	case INFER_IOC_HDMA_DBG: {
+		struct infer_hdma_dbg dbg;
+
+		if (copy_from_user(&dbg, uarg, sizeof(dbg)))
+			return -EFAULT;
+		if (!rc->hdma_iomem)
+			return -ENODEV;
+		if ((dbg.offset & 0x3) || dbg.offset + 4 > rc->hdma_len)
+			return -EINVAL;
+		if (dbg.is_write)
+			writel(dbg.value, rc->hdma_iomem + dbg.offset);
+		dbg.out = readl(rc->hdma_iomem + dbg.offset);
+		if (copy_to_user(uarg, &dbg, sizeof(dbg)))
+			return -EFAULT;
+		return 0;
+	}
+
 	default:
 		return -ENOTTY;
 	}
@@ -568,8 +588,17 @@ static int infer_map_doorbell(struct infer_rc *rc)
 		pci_iounmap(pdev, base);
 		return -EINVAL;
 	}
+	rc->db_bar_base = base;
 	rc->db_iomem = base + rc->db_offset;
 	dev_info(&pdev->dev, "doorbell mapped BAR%d+0x%x\n", bar, rc->db_offset);
+
+	/* HDMA regs live in the same BAR0 target0 window at 0x4000 */
+	if (pci_resource_len(pdev, bar) > BST_TRGT0_HDMA_BASE) {
+		rc->hdma_iomem = base + BST_TRGT0_HDMA_BASE;
+		rc->hdma_len = pci_resource_len(pdev, bar) - BST_TRGT0_HDMA_BASE;
+		dev_info(&pdev->dev, "HDMA regs mapped BAR%d+0x%x len=0x%zx\n",
+			 bar, BST_TRGT0_HDMA_BASE, rc->hdma_len);
+	}
 	return 0;
 }
 

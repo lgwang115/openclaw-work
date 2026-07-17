@@ -158,6 +158,54 @@ struct infer_ep_info {
 
 #define INFER_EP_IOC_GET_INFO       _IOR(INFER_EP_IOC_MAGIC, 5, struct infer_ep_info)
 
+/* =====================================================================
+ * HDMA register debug (RC side) — poke the EP's DesignWare HDMA regs via
+ * BAR0 + BST_TRGT0_HDMA_BASE. For bring-up/verification of the direct-HDMA
+ * completion path; NOT used by the data path. offset is relative to the
+ * HDMA register block base (i.e. BAR0 + 0x4000).
+ * ===================================================================== */
+
+/* BST target0 layout (BAR0): doorbell @ 0xE00, HDMA regs @ 0x4000 */
+#define BST_TRGT0_HDMA_BASE         0x4000u
+
+/* dw-hdma-v0 per-channel block */
+#define HDMA_V0_CH_STRIDE           0x200u   /* channel i base = i*0x200 */
+#define HDMA_V0_RD_OFF              0x100u   /* read block within a channel */
+#define HDMA_V0_WR_OFF              0x000u   /* write block within a channel */
+#define HDMA_V0_CH_EN               0x00u
+#define HDMA_V0_CH_DOORBELL         0x04u
+#define HDMA_V0_CH_XFERSIZE         0x1cu
+#define HDMA_V0_CH_SAR_LO           0x20u
+#define HDMA_V0_CH_SAR_HI           0x24u
+#define HDMA_V0_CH_DAR_LO           0x28u
+#define HDMA_V0_CH_DAR_HI           0x2cu
+#define HDMA_V0_CH_STAT             0x80u   /* [2:0] 1=RUN 2=ABORT 3=STOP */
+#define HDMA_V0_CH_INT_STAT         0x84u   /* bit0=STOP bit2=ABORT */
+#define HDMA_V0_CH_INT_SETUP        0x88u
+#define HDMA_V0_CH_INT_CLEAR        0x8cu
+
+#define HDMA_V0_STAT_MASK           0x7u
+#define HDMA_V0_STAT_RUNNING        0x1u
+#define HDMA_V0_STAT_ABORTED        0x2u
+#define HDMA_V0_STAT_STOPPED        0x3u
+#define HDMA_V0_STOP_INT            (1u << 0)
+#define HDMA_V0_ABORT_INT           (1u << 2)
+
+/* rd-channel register offset from HDMA base (0x4000) */
+#define HDMA_V0_RD_REG(ch, reg) \
+	((ch) * HDMA_V0_CH_STRIDE + HDMA_V0_RD_OFF + (reg))
+#define HDMA_V0_WR_REG(ch, reg) \
+	((ch) * HDMA_V0_CH_STRIDE + HDMA_V0_WR_OFF + (reg))
+
+struct infer_hdma_dbg {
+	__u32 offset;    /* byte offset from HDMA base (BAR0+0x4000), 4-aligned */
+	__u32 is_write;  /* nonzero: writel(value) before reading back */
+	__u32 value;     /* in: value to write */
+	__u32 out;       /* out: value read back */
+};
+
+#define INFER_IOC_HDMA_DBG          _IOWR(INFER_IOC_MAGIC, 16, struct infer_hdma_dbg)
+
 /*
  * EP-side eDMA timing stats (submit → completion callback), accumulated in
  * the driver with zero per-transfer printk. Reading with INFER_EP_IOC_DMA_STATS

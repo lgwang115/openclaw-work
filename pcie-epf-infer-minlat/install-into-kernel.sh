@@ -69,20 +69,21 @@ echo "==> Build userspace tools"
 "${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/inferzc" "$SRC/inferzc.c"
 "${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/test_pcie_comm_ep2" "$SRC/test_pcie_comm_ep2.c"
 "${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/inferdmastat" "$SRC/inferdmastat.c"
+"${CROSS_COMPILE}gcc" -O2 -Wall -I"$SRC" -o "$SRC/inferhdma" "$SRC/inferhdma.c"
 
 echo
 echo "DONE. Artifacts:"
 ls -l "$EP_DIR/pci_epf_infer.ko" "$MISC_DIR/infer_rc.ko" \
 	"$MISC_DIR/infer_dmabuf_test.ko" \
 	"$SRC/inferlat" "$SRC/inferpush" "$SRC/inferzc" \
-	"$SRC/inferdmastat" "$SRC/test_pcie_comm_ep2"
+	"$SRC/inferdmastat" "$SRC/inferhdma" "$SRC/test_pcie_comm_ep2"
 echo
 echo "Copy to BOTH boards:"
 echo "  for IP in <A_IP> <B_IP>; do"
 echo "    scp $EP_DIR/pci_epf_infer.ko $MISC_DIR/infer_rc.ko \\"
 echo "        $MISC_DIR/infer_dmabuf_test.ko \\"
 echo "        $SRC/inferlat $SRC/inferpush $SRC/inferzc \\"
-echo "        $SRC/inferdmastat $SRC/test_pcie_comm_ep2 \\"
+echo "        $SRC/inferdmastat $SRC/inferhdma $SRC/test_pcie_comm_ep2 \\"
 echo "        root@\$IP:/userdata/ep_test/"
 echo "  done"
 echo

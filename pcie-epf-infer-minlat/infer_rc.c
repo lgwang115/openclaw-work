@@ -28,6 +28,21 @@
 #define DRV_NAME "infer_rc"
 #define INFER_RC_MAX_MAPS 16
 
+/*
+ * eDMA-written completion (hw_done) — EXPERIMENTAL, default OFF.
+ *
+ * The 2-element linked-list approach (data element + tag element) is NOT
+ * ordered: dw-edma pipelines/prefetches LL elements, so the tag can land
+ * before the data has fully arrived (observed: 2MB "completing" in ~2us).
+ * That would let RC see completion before the data is in EP memory -> torn
+ * data. Keep it off until element ordering can be guaranteed. Set hwdone=1
+ * only for experiments.
+ */
+static bool hwdone;
+module_param(hwdone, bool, 0644);
+MODULE_PARM_DESC(hwdone,
+	"EXPERIMENTAL: use eDMA-written hw_done for WRITE completion (unordered, default off)");
+
 enum infer_map_kind {
 	INFER_MAP_NONE = 0,
 	INFER_MAP_USER,
@@ -150,7 +165,7 @@ static int infer_do_xfer(struct infer_rc *rc, struct infer_xfer *x)
 	 * regs->hw_done — RC then sees completion without the EP IRQ/callback.
 	 * Needs room for the 4-byte trailer in the staging buffer.
 	 */
-	if (x->cmd == INFER_CMD_WRITE && rc->buf &&
+	if (hwdone && x->cmd == INFER_CMD_WRITE && rc->buf &&
 	    (size_t)x->size + sizeof(u32) <= rc->buf_size) {
 		*(u32 *)((u8 *)rc->buf + x->size) = INFER_HW_DONE_MAGIC;
 		writel(INFER_XF_HWDONE, &regs->xfer_flags);

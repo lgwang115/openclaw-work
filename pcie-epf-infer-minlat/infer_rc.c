@@ -76,19 +76,38 @@ static void infer_ring_doorbell(struct infer_rc *rc)
 		writel(rc->db_msg, rc->db_iomem);
 }
 
-static int infer_poll_status(struct infer_rc *rc, u64 timeout_ns, u64 *lat_ns)
+/*
+ * Poll for completion. Fast path (use_hwdone): the EP eDMA writes
+ * INFER_HW_DONE_MAGIC into regs->hw_done right after the data lands, so we see
+ * it without waiting for the EP completion IRQ/callback. status (callback
+ * written) is kept as a fallback / for the non-hwdone path.
+ */
+static int infer_poll_status(struct infer_rc *rc, u64 timeout_ns, u64 *lat_ns,
+			     bool use_hwdone)
 {
 	struct infer_regs_v2 __iomem *regs = rc->ctrl;
 	ktime_t t0, t1;
-	u32 st;
+	u32 st = INFER_STATUS_IDLE;
+	bool done = false, fail = false;
 
 	t0 = ktime_get();
 	infer_ring_doorbell(rc);
 
 	do {
-		st = readl(&regs->status);
-		if (st == INFER_STATUS_OK || st == INFER_STATUS_FAIL)
+		if (use_hwdone &&
+		    readl(&regs->hw_done) == INFER_HW_DONE_MAGIC) {
+			done = true;
 			break;
+		}
+		st = readl(&regs->status);
+		if (st == INFER_STATUS_OK) {
+			done = true;
+			break;
+		}
+		if (st == INFER_STATUS_FAIL) {
+			fail = true;
+			break;
+		}
 		cpu_relax();
 		t1 = ktime_get();
 	} while (ktime_to_ns(ktime_sub(t1, t0)) < timeout_ns);
@@ -97,9 +116,9 @@ static int infer_poll_status(struct infer_rc *rc, u64 timeout_ns, u64 *lat_ns)
 	if (lat_ns)
 		*lat_ns = ktime_to_ns(ktime_sub(t1, t0));
 
-	if (st == INFER_STATUS_OK)
+	if (done)
 		return 0;
-	if (st == INFER_STATUS_FAIL)
+	if (fail)
 		return -EIO;
 	return -ETIMEDOUT;
 }
@@ -110,6 +129,7 @@ static int infer_do_xfer(struct infer_rc *rc, struct infer_xfer *x)
 	u64 timeout_ns = x->timeout_us ? x->timeout_us * 1000ull : 100000000ull;
 	u64 lat;
 	int ret;
+	bool use_hwdone = false;
 
 	if (x->cmd != INFER_CMD_WRITE && x->cmd != INFER_CMD_READ)
 		return -EINVAL;
@@ -117,16 +137,32 @@ static int infer_do_xfer(struct infer_rc *rc, struct infer_xfer *x)
 		return -EINVAL;
 
 	writel(INFER_STATUS_IDLE, &regs->status);
+	writel(0, &regs->hw_done);
 	writel(x->size, &regs->size);
 	writel(lower_32_bits(rc->buf_dma),
 	       (void __iomem *)&regs->pci_addr);
 	writel(upper_32_bits(rc->buf_dma),
 	       (void __iomem *)&regs->pci_addr + 4);
+
+	/*
+	 * WRITE = EP reads our buffer (DEV_TO_MEM). Place the eDMA completion
+	 * tag right after the payload so the EP's 2nd LL element copies it into
+	 * regs->hw_done — RC then sees completion without the EP IRQ/callback.
+	 * Needs room for the 4-byte trailer in the staging buffer.
+	 */
+	if (x->cmd == INFER_CMD_WRITE && rc->buf &&
+	    (size_t)x->size + sizeof(u32) <= rc->buf_size) {
+		*(u32 *)((u8 *)rc->buf + x->size) = INFER_HW_DONE_MAGIC;
+		writel(INFER_XF_HWDONE, &regs->xfer_flags);
+		use_hwdone = true;
+	} else {
+		writel(0, &regs->xfer_flags);
+	}
 	wmb();
 	writel(x->cmd, &regs->command);
 	wmb();
 
-	ret = infer_poll_status(rc, timeout_ns, &lat);
+	ret = infer_poll_status(rc, timeout_ns, &lat, use_hwdone);
 	x->timeout_us = lat;
 	x->result = ret;
 	return ret;
@@ -145,6 +181,8 @@ static int infer_do_push(struct infer_rc *rc, struct infer_push *p)
 		return -EINVAL;
 
 	writel(INFER_STATUS_IDLE, &regs->status);
+	writel(0, &regs->hw_done);
+	writel(0, &regs->xfer_flags);   /* PUSH keeps the callback-status path for now */
 	writel(p->slot, &regs->slot);
 	writel(p->size, &regs->size);
 	writel(lower_32_bits(p->pci_addr),
@@ -155,7 +193,7 @@ static int infer_do_push(struct infer_rc *rc, struct infer_push *p)
 	writel(INFER_CMD_PUSH, &regs->command);
 	wmb();
 
-	ret = infer_poll_status(rc, timeout_ns, &lat);
+	ret = infer_poll_status(rc, timeout_ns, &lat, false);
 	p->timeout_us = lat;
 	p->result = ret;
 	return ret;

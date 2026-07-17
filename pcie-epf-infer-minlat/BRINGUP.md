@@ -389,6 +389,21 @@ cd /userdata/ep_test
 
 相对 `pci_epf_test` 路径的 2～5ms，4KB 延迟约改善 **100×+**。小包地板约 **16～18µs**（门铃 IRQ + eDMA 提交 + status 轮询）；大包受链路吞吐限制，约 6.0～6.1 GB/s。
 
+### eDMA 自写完成标志(hw_done),绕开完成中断/回调
+
+HDMA native 是 linked-list 模式。WRITE(EP 读 RC → 本地,DEV_TO_MEM)时,EP 把传输编成 **2 元素 LL**:
+
+```
+元素0: 数据      远端 pci_addr      → 本地 buf/local_dst   len=size
+元素1: 完成标志  远端 pci_addr+size → 本地 regs->hw_done    len=4
+```
+
+dw-edma 的远端地址逐元素累加(见 `dw_edma_device_transfer`),所以元素1 从 RC 内存 `pci_addr+size` 读出 RC 预置的 `INFER_HW_DONE_MAGIC`,写进 EP 的 `regs->hw_done`。**RC 轮询 `hw_done` 即完成——数据一落地就置位,不等 EP 完成中断→tasklet→回调那 ~10µs。** EP 回调仍会跑(写 `status=OK` 作兜底 + slot 记账),但已不在 RC 关键路径上。
+
+- RC 侧:发送前把标志写到 `buf[size]`、`hw_done=0`、`xfer_flags=INFER_XF_HWDONE`,轮询 `hw_done==MAGIC`(`status` 兜底)。要求 staging 缓冲有 4 字节尾部余量(`size+4 ≤ buf_size`)。
+- 目前接线在 **v1 WRITE(`inferlat w`)**;READ(MEM_TO_DEV)和 PUSH 暂走原 `status` 回调路径。
+- 前提:host 无需写 HDMA 寄存器(只有 EP 的 eDMA 在写),规避了 A2000 上 host 不能写 HDMA 的限制。
+
 ### 对照：门铃 → workqueue 路径（优化前）
 
 4KB 中位约 **24µs**，2MB 约 **6.2 GB/s**。去掉 workqueue 后小包约再降 **7µs**。

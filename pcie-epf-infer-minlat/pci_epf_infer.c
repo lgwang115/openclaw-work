@@ -42,18 +42,6 @@ module_param(dma_log_every, uint, 0644);
 MODULE_PARM_DESC(dma_log_every,
 	"log an eDMA timing summary every N completed transfers (0=off)");
 
-/*
- * Diagnostic: after issuing the eDMA, bounded busy-poll dma_async_is_tx_complete
- * in the doorbell handler to timestamp when the HARDWARE finished, without
- * changing the completion path (the async callback still writes status). Lets us
- * split issue→callback into "issue→HW done" vs "HW done→callback dispatch".
- * 0 = off (default). Value = max microseconds to poll before giving up.
- */
-static unsigned int dma_poll_diag;
-module_param(dma_poll_diag, uint, 0644);
-MODULE_PARM_DESC(dma_poll_diag,
-	"diagnostic: poll HW completion up to N us to time issue->HW-done (0=off)");
-
 struct epf_infer_slot {
 	dma_addr_t		local_dst;
 	size_t			capacity;
@@ -92,7 +80,6 @@ struct epf_infer {
 	u64			dma_t0_ns;    /* issue timestamp of in-flight DMA */
 	u64			ts_h_ns;      /* doorbell handler entry (accepted cmd) */
 	u64			ts_setup_ns;  /* dma_submit entry (before slave_config) */
-	u64			dma_hwdone_ns; /* diag: HW completion detected by polling */
 	size_t			dma_cur_bytes;
 	u64			dma_count;
 	u64			dma_sum_ns;
@@ -104,8 +91,6 @@ struct epf_infer {
 	u64			prologue_sum_ns, prologue_min_ns, prologue_max_ns;
 	u64			setup_sum_ns, setup_min_ns, setup_max_ns;
 	u64			total_sum_ns, total_min_ns, total_max_ns;
-	/* diag: issue → HW-done (polled); count may be < dma_count */
-	u64			hwdone_count, hwdone_sum_ns, hwdone_min_ns, hwdone_max_ns;
 	struct epf_infer_slot	slots[INFER_V2_SLOTS];
 	wait_queue_head_t	slot_wq;
 	struct miscdevice	ep_misc;
@@ -256,22 +241,11 @@ static void epf_infer_dma_account_locked(struct epf_infer *ctx)
 			ctx->total_max_ns, first, dt);
 	}
 
-	/* diag: issue → HW-done (polled). Own count (may miss on races). */
-	if (ctx->dma_hwdone_ns && ctx->dma_hwdone_ns >= ctx->dma_t0_ns) {
-		bool hfirst = (ctx->hwdone_count == 0);
-
-		dt = ctx->dma_hwdone_ns - ctx->dma_t0_ns;
-		EPF_ACC(ctx->hwdone_sum_ns, ctx->hwdone_min_ns,
-			ctx->hwdone_max_ns, hfirst, dt);
-		ctx->hwdone_count++;
-	}
-
 	ctx->dma_bytes += ctx->dma_cur_bytes;
 	ctx->dma_count++;
 	ctx->dma_t0_ns = 0;
 	ctx->ts_h_ns = 0;
 	ctx->ts_setup_ns = 0;
-	ctx->dma_hwdone_ns = 0;
 
 	if (dma_log_every && (ctx->dma_count % dma_log_every) == 0) {
 		u64 n = ctx->dma_count;
@@ -433,28 +407,6 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 		epf_infer_finish_locked(ctx, ret);
 		spin_unlock_irqrestore(&ctx->lock, flags);
 		wake_up_interruptible(&ctx->slot_wq);
-		return IRQ_HANDLED;
-	}
-
-	/*
-	 * Diagnostic only: bounded busy-poll to timestamp when the HW finishes.
-	 * Does not touch the completion path — the async callback still runs and
-	 * writes status. Reads HW status directly, so ts is accurate even though
-	 * the completion IRQ may be deferred behind this handler.
-	 */
-	if (dma_poll_diag) {
-		u64 t0 = ktime_get_ns();
-		u64 budget = (u64)dma_poll_diag * 1000ull;
-
-		do {
-			if (dma_async_is_tx_complete(ctx->cur_chan,
-						     ctx->cur_cookie,
-						     NULL, NULL) == DMA_COMPLETE) {
-				ctx->dma_hwdone_ns = ktime_get_ns();
-				break;
-			}
-			cpu_relax();
-		} while (ktime_get_ns() - t0 < budget);
 	}
 	return IRQ_HANDLED;
 }
@@ -1042,10 +994,6 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 		stats.total_sum_ns = ctx->total_sum_ns;
 		stats.total_min_ns = ctx->dma_count ? ctx->total_min_ns : 0;
 		stats.total_max_ns = ctx->total_max_ns;
-		stats.hwdone_count = ctx->hwdone_count;
-		stats.hwdone_sum_ns = ctx->hwdone_sum_ns;
-		stats.hwdone_min_ns = ctx->hwdone_count ? ctx->hwdone_min_ns : 0;
-		stats.hwdone_max_ns = ctx->hwdone_max_ns;
 		if (reset) {
 			ctx->dma_count = 0;
 			ctx->dma_sum_ns = 0;
@@ -1062,10 +1010,6 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 			ctx->total_sum_ns = 0;
 			ctx->total_min_ns = 0;
 			ctx->total_max_ns = 0;
-			ctx->hwdone_count = 0;
-			ctx->hwdone_sum_ns = 0;
-			ctx->hwdone_min_ns = 0;
-			ctx->hwdone_max_ns = 0;
 		}
 		spin_unlock_irqrestore(&ctx->lock, flags);
 

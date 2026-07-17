@@ -187,11 +187,6 @@ struct infer_ep_dma_stats {
 	__u64 total_sum_ns;    /* handler entry → completion callback (EP internal) */
 	__u64 total_min_ns;
 	__u64 total_max_ns;
-	/* diagnostic: issue → HW-done (polled); hwdone_count may be < count */
-	__u64 hwdone_count;
-	__u64 hwdone_sum_ns;
-	__u64 hwdone_min_ns;
-	__u64 hwdone_max_ns;
 };
 
 #define INFER_EP_IOC_DMA_STATS      _IOWR(INFER_EP_IOC_MAGIC, 6, struct infer_ep_dma_stats)

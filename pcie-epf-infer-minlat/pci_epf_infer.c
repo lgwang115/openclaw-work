@@ -77,7 +77,9 @@ struct epf_infer {
 	u32			pend_slot;
 	u32			pend_size;
 	/* eDMA timing stats (submit → completion callback), protected by lock */
-	u64			dma_t0_ns;    /* submit timestamp of in-flight DMA */
+	u64			dma_t0_ns;    /* issue timestamp of in-flight DMA */
+	u64			ts_h_ns;      /* doorbell handler entry (accepted cmd) */
+	u64			ts_setup_ns;  /* dma_submit entry (before slave_config) */
 	size_t			dma_cur_bytes;
 	u64			dma_count;
 	u64			dma_sum_ns;
@@ -85,6 +87,10 @@ struct epf_infer {
 	u64			dma_max_ns;
 	u64			dma_last_ns;
 	u64			dma_bytes;
+	/* per-segment breakdown (same dma_count) */
+	u64			prologue_sum_ns, prologue_min_ns, prologue_max_ns;
+	u64			setup_sum_ns, setup_min_ns, setup_max_ns;
+	u64			total_sum_ns, total_min_ns, total_max_ns;
 	struct epf_infer_slot	slots[INFER_V2_SLOTS];
 	wait_queue_head_t	slot_wq;
 	struct miscdevice	ep_misc;
@@ -146,6 +152,9 @@ static int epf_infer_dma_submit(struct epf_infer *ctx,
 	if (!chan)
 		return -ENODEV;
 
+	/* segment start: slave_config + prep + submit (before t0/issue) */
+	ctx->ts_setup_ns = ktime_get_ns();
+
 	sconf.direction = dir;
 	if (dir == DMA_MEM_TO_DEV)
 		sconf.dst_addr = remote;
@@ -180,32 +189,71 @@ static int epf_infer_dma_submit(struct epf_infer *ctx,
 	return 0;
 }
 
-/* Accumulate one submit→callback interval. Caller holds ctx->lock. */
+#define EPF_ACC(sum, mn, mx, first, dt) do {         \
+	if ((first) || (dt) < (mn))                  \
+		(mn) = (dt);                         \
+	if ((dt) > (mx))                             \
+		(mx) = (dt);                         \
+	(sum) += (dt);                               \
+} while (0)
+
+/*
+ * Accumulate one transfer's timing. Caller holds ctx->lock, runs in the DMA
+ * completion callback. Splits EP-internal time into segments:
+ *   prologue = handler entry → dma_submit entry  (command parse + lock)
+ *   setup    = slave_config + prep + submit       (ts_setup → issue/t0)
+ *   xfer     = issue → this callback              (eDMA + completion dispatch)
+ *   total    = handler entry → this callback      (EP internal round)
+ */
 static void epf_infer_dma_account_locked(struct epf_infer *ctx)
 {
-	u64 dt;
+	u64 now, dt;
+	bool first;
 
 	if (!ctx->dma_t0_ns)
 		return;
-	dt = ktime_get_ns() - ctx->dma_t0_ns;
-	ctx->dma_t0_ns = 0;
+	now = ktime_get_ns();
+	first = (ctx->dma_count == 0);
 
-	if (ctx->dma_count == 0 || dt < ctx->dma_min_ns)
-		ctx->dma_min_ns = dt;
-	if (dt > ctx->dma_max_ns)
-		ctx->dma_max_ns = dt;
-	ctx->dma_sum_ns += dt;
+	/* xfer: issue → callback */
+	dt = now - ctx->dma_t0_ns;
+	EPF_ACC(ctx->dma_sum_ns, ctx->dma_min_ns, ctx->dma_max_ns, first, dt);
 	ctx->dma_last_ns = dt;
+
+	/* setup: ts_setup → issue */
+	if (ctx->ts_setup_ns && ctx->dma_t0_ns > ctx->ts_setup_ns) {
+		dt = ctx->dma_t0_ns - ctx->ts_setup_ns;
+		EPF_ACC(ctx->setup_sum_ns, ctx->setup_min_ns,
+			ctx->setup_max_ns, first, dt);
+	}
+
+	/* prologue: handler entry → ts_setup */
+	if (ctx->ts_h_ns && ctx->ts_setup_ns > ctx->ts_h_ns) {
+		dt = ctx->ts_setup_ns - ctx->ts_h_ns;
+		EPF_ACC(ctx->prologue_sum_ns, ctx->prologue_min_ns,
+			ctx->prologue_max_ns, first, dt);
+	}
+
+	/* total: handler entry → callback */
+	if (ctx->ts_h_ns && now > ctx->ts_h_ns) {
+		dt = now - ctx->ts_h_ns;
+		EPF_ACC(ctx->total_sum_ns, ctx->total_min_ns,
+			ctx->total_max_ns, first, dt);
+	}
+
 	ctx->dma_bytes += ctx->dma_cur_bytes;
 	ctx->dma_count++;
+	ctx->dma_t0_ns = 0;
+	ctx->ts_h_ns = 0;
+	ctx->ts_setup_ns = 0;
 
 	if (dma_log_every && (ctx->dma_count % dma_log_every) == 0) {
-		u64 avg = ctx->dma_sum_ns / ctx->dma_count;
+		u64 n = ctx->dma_count;
 
 		dev_info(&ctx->epf->dev,
-			 "eDMA n=%llu last=%lluns min=%lluns max=%lluns avg=%lluns (last %zuB)\n",
-			 ctx->dma_count, ctx->dma_last_ns, ctx->dma_min_ns,
-			 ctx->dma_max_ns, avg, ctx->dma_cur_bytes);
+			 "eDMA n=%llu avg(ns): prologue=%llu setup=%llu xfer=%llu total=%llu\n",
+			 n, ctx->prologue_sum_ns / n, ctx->setup_sum_ns / n,
+			 ctx->dma_sum_ns / n, ctx->total_sum_ns / n);
 	}
 }
 
@@ -269,6 +317,7 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 	unsigned long flags;
 	u32 cmd, size, slot_idx;
 	u64 pci_addr;
+	u64 t_h = ktime_get_ns();  /* handler entry (before doorbell→handler is unmeasurable) */
 	dma_addr_t local;
 	enum dma_transfer_direction dir;
 	int ret;
@@ -299,6 +348,7 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 	ctx->pend_cmd = cmd;
 	ctx->pend_slot = slot_idx;
 	ctx->pend_size = size;
+	ctx->ts_h_ns = t_h;
 
 	switch (cmd) {
 	case INFER_CMD_WRITE:
@@ -935,6 +985,15 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 		stats.max_ns = ctx->dma_max_ns;
 		stats.last_ns = ctx->dma_last_ns;
 		stats.bytes = ctx->dma_bytes;
+		stats.prologue_sum_ns = ctx->prologue_sum_ns;
+		stats.prologue_min_ns = ctx->dma_count ? ctx->prologue_min_ns : 0;
+		stats.prologue_max_ns = ctx->prologue_max_ns;
+		stats.setup_sum_ns = ctx->setup_sum_ns;
+		stats.setup_min_ns = ctx->dma_count ? ctx->setup_min_ns : 0;
+		stats.setup_max_ns = ctx->setup_max_ns;
+		stats.total_sum_ns = ctx->total_sum_ns;
+		stats.total_min_ns = ctx->dma_count ? ctx->total_min_ns : 0;
+		stats.total_max_ns = ctx->total_max_ns;
 		if (reset) {
 			ctx->dma_count = 0;
 			ctx->dma_sum_ns = 0;
@@ -942,6 +1001,15 @@ static long epf_infer0_ioctl(struct file *filp, unsigned int cmd,
 			ctx->dma_max_ns = 0;
 			ctx->dma_last_ns = 0;
 			ctx->dma_bytes = 0;
+			ctx->prologue_sum_ns = 0;
+			ctx->prologue_min_ns = 0;
+			ctx->prologue_max_ns = 0;
+			ctx->setup_sum_ns = 0;
+			ctx->setup_min_ns = 0;
+			ctx->setup_max_ns = 0;
+			ctx->total_sum_ns = 0;
+			ctx->total_min_ns = 0;
+			ctx->total_max_ns = 0;
 		}
 		spin_unlock_irqrestore(&ctx->lock, flags);
 

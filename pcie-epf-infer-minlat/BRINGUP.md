@@ -429,8 +429,27 @@ insmod ./infer_dmabuf_test.ko
 `inferdmastat` 是同一批传输里 **EP eDMA submit→回调** 那段。两者相减≈门铃 IRQ + status 开销。  
 `iters ≤ 20` 时还会逐次打印 `iter i: total .. µs`。
 
-测的是 `submit→回调`（含 eDMA 排队 + 搬运 + 完成中断→回调调度），是 RC 端到端 `lat_ns` 的**子集**；  
-`RC 端到端 − eDMA avg ≈ 门铃 IRQ + status 写回/轮询开销`。
+`inferdmastat` 现在打印 **EP 内部分段**（同一 EP 时钟,准确）:
+
+```
+EP-internal breakdown  n=1000  size=4096 B/xfer
+  prologue (parse+lock):       min=.. avg=.. max=.. µs   # handler 入口→dma_submit 入口
+  setup (slave_cfg+prep):      min=.. avg=.. max=.. µs   # slave_config + prep + submit
+  xfer (issue->cb):            min=.. avg=.. max=.. µs   # eDMA 搬运 + 完成回调派发
+  EP total (handler->cb):      min=.. avg=.. max=.. µs   # EP 内部总时长
+```
+
+口径说明:
+
+- `setup`（slave_config + prep_slave_single）就是"5µs gap"里那段,**现在可精确读**。
+- **`门铃 → handler`（IRQ 延迟)测不到**:起点在 RC(写门铃)、终点在 EP(handler 入口),两颗芯片时钟不同源。
+  - 合并桶:`RC 端到端(inferzc RC total) − EP total = 门铃传播 + IRQ 延迟 + status 回传 + RC 轮询`。
+  - 纯 IRQ 延迟用 EP 本地 **ftrace**:
+    ```bash
+    cd /sys/kernel/debug/tracing
+    echo 1 > events/irq/irq_handler_entry/enable
+    # 或用 RT 的 irqsoff / hwlat tracer 看中断关闭/硬件延迟分布
+    ```
 
 ### v2 零拷贝 smoke（单次冷启动，非中位）
 

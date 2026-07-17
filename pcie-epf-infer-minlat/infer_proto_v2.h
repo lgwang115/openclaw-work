@@ -171,11 +171,22 @@ struct infer_ep_dma_stats {
 	__u32 reset;          /* in: nonzero => zero counters after reading */
 	__u32 pad;
 	__u64 count;          /* completed DMAs since last reset */
-	__u64 sum_ns;         /* sum of submit→cb durations */
+	/* eDMA issue → completion callback (transfer + completion dispatch) */
+	__u64 sum_ns;
 	__u64 min_ns;
 	__u64 max_ns;
 	__u64 last_ns;
 	__u64 bytes;          /* total bytes moved */
+	/* per-segment breakdown (same count), all EP-local clock */
+	__u64 prologue_sum_ns; /* handler entry → dma_submit entry (parse+lock) */
+	__u64 prologue_min_ns;
+	__u64 prologue_max_ns;
+	__u64 setup_sum_ns;    /* slave_config + prep_slave_single + submit */
+	__u64 setup_min_ns;
+	__u64 setup_max_ns;
+	__u64 total_sum_ns;    /* handler entry → completion callback (EP internal) */
+	__u64 total_min_ns;
+	__u64 total_max_ns;
 };
 
 #define INFER_EP_IOC_DMA_STATS      _IOWR(INFER_EP_IOC_MAGIC, 6, struct infer_ep_dma_stats)

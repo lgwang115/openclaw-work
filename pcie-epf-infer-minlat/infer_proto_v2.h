@@ -46,25 +46,8 @@ struct infer_regs_v2 {
 	__u32 posted_mask;    /* EP→RC: bit i => slot i POSTED (credit) */
 	__u32 done_mask;      /* EP→RC: bit i => slot i DONE */
 	__u32 ep_flags;       /* capability bits, see INFER_EP_F_* */
-	/*
-	 * hw_done: written by the EP eDMA itself (a 2nd linked-list element)
-	 * right after the data lands, so RC sees completion without waiting for
-	 * the completion IRQ/callback. RC resets it to 0 before ringing and
-	 * polls for INFER_HW_DONE_MAGIC. status (callback-written) stays as a
-	 * fallback. Only for DEV_TO_MEM (EP reads RC → local) with a trailer.
-	 */
-	__u32 hw_done;
-	/*
-	 * xfer_flags: RC → EP per-command. INFER_XF_HWDONE means RC placed the
-	 * completion tag at pci_addr+size and wants the EP eDMA to append a 2nd
-	 * LL element that writes it into hw_done (fast completion, no IRQ wait).
-	 */
-	__u32 xfer_flags;
-	__u32 reserved_v2[2];
+	__u32 reserved_v2[4];
 } __attribute__((packed));
-
-#define INFER_HW_DONE_MAGIC         0x00d02e00u  /* eDMA-written completion tag */
-#define INFER_XF_HWDONE             (1u << 0)    /* append eDMA hw_done element */
 
 #define INFER_EP_F_ZEROCOPY         (1u << 0)  /* POST_RECV + PUSH supported */
 #define INFER_EP_F_DMABUF           (1u << 1)  /* EP accepts dma-buf fd */

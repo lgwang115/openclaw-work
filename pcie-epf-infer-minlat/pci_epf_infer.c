@@ -58,7 +58,6 @@ struct epf_infer_slot {
 struct epf_infer {
 	struct pci_epf		*epf;
 	struct infer_regs_v2	*regs;
-	dma_addr_t		regs_dma;     /* DMA/phys addr of BAR1 backing (for eDMA hw_done write) */
 	void			*buf;
 	dma_addr_t		buf_dma;
 	size_t			buf_size;
@@ -138,17 +137,11 @@ static void epf_infer_dma_cb(void *param);
 /*
  * Submit eDMA only (no wait). Safe from doorbell IRQ.
  * Completion is handled in epf_infer_dma_cb.
- *
- * If hw_done is set (DEV_TO_MEM only), append a 2nd linked-list element that
- * copies the completion tag from remote+size (RC memory) into regs->hw_done,
- * so RC sees completion the instant the data lands — no IRQ/callback on the
- * critical path. dw-edma advances the remote address per SG element, so the
- * 2nd element's source is remote+size (the RC-provided tag trailer).
  */
 static int epf_infer_dma_submit(struct epf_infer *ctx,
 				enum dma_transfer_direction dir,
 				dma_addr_t remote, dma_addr_t local,
-				size_t size, bool hw_done)
+				size_t size)
 {
 	struct dma_chan *chan = (dir == DMA_DEV_TO_MEM) ? ctx->dma_rx : ctx->dma_tx;
 	struct dma_async_tx_descriptor *desc;
@@ -158,10 +151,6 @@ static int epf_infer_dma_submit(struct epf_infer *ctx,
 
 	if (!chan)
 		return -ENODEV;
-
-	/* hw_done only makes sense for EP-reads-RC (DEV_TO_MEM) with a valid BAR1 addr */
-	if (hw_done && (dir != DMA_DEV_TO_MEM || !ctx->regs_dma))
-		hw_done = false;
 
 	/* segment start: slave_config + prep + submit (before t0/issue) */
 	ctx->ts_setup_ns = ktime_get_ns();
@@ -177,25 +166,8 @@ static int epf_infer_dma_submit(struct epf_infer *ctx,
 		return ret;
 
 	ctx->cur_chan = chan;
-
-	if (hw_done) {
-		struct scatterlist sg[2];
-
-		sg_init_table(sg, 2);
-		/* element 0: the payload (remote+0 -> local) */
-		sg_dma_address(&sg[0]) = local;
-		sg_dma_len(&sg[0]) = size;
-		/* element 1: the tag (remote+size -> regs->hw_done) */
-		sg_dma_address(&sg[1]) = ctx->regs_dma +
-			offsetof(struct infer_regs_v2, hw_done);
-		sg_dma_len(&sg[1]) = sizeof(u32);
-
-		desc = dmaengine_prep_slave_sg(chan, sg, 2, dir,
-					       DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
-	} else {
-		desc = dmaengine_prep_slave_single(chan, local, size, dir,
-						   DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
-	}
+	desc = dmaengine_prep_slave_single(chan, local, size, dir,
+					   DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
 	if (!desc)
 		return -EIO;
 
@@ -343,12 +315,11 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 	struct infer_regs_v2 *regs = ctx->regs;
 	struct epf_infer_slot *slot;
 	unsigned long flags;
-	u32 cmd, size, slot_idx, xfer_flags;
+	u32 cmd, size, slot_idx;
 	u64 pci_addr;
 	u64 t_h = ktime_get_ns();  /* handler entry (before doorbell→handler is unmeasurable) */
 	dma_addr_t local;
 	enum dma_transfer_direction dir;
-	bool hw_done;
 	int ret;
 
 	if (!regs)
@@ -369,8 +340,6 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 	size = READ_ONCE(regs->size);
 	pci_addr = READ_ONCE(regs->pci_addr);
 	slot_idx = READ_ONCE(regs->slot);
-	xfer_flags = READ_ONCE(regs->xfer_flags);
-	hw_done = !!(xfer_flags & INFER_XF_HWDONE);
 
 	WRITE_ONCE(regs->command, INFER_CMD_NONE);
 	WRITE_ONCE(regs->status, INFER_STATUS_BUSY);
@@ -432,7 +401,7 @@ static int epf_infer_doorbell_handler(int irq, void *arg)
 	}
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
-	ret = epf_infer_dma_submit(ctx, dir, pci_addr, local, size, hw_done);
+	ret = epf_infer_dma_submit(ctx, dir, pci_addr, local, size);
 	if (ret) {
 		spin_lock_irqsave(&ctx->lock, flags);
 		epf_infer_finish_locked(ctx, ret);
@@ -577,7 +546,6 @@ static int epf_infer_set_ctrl_bar(struct pci_epf *epf)
 			return -ENOMEM;
 		}
 		ctx->regs = base;
-		ctx->regs_dma = epf_bar->phys_addr;
 	}
 
 	memset(ctx->regs, 0, sizeof(*ctx->regs));

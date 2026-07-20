@@ -593,11 +593,11 @@ static int infer_map_doorbell(struct infer_rc *rc)
 	dev_info(&pdev->dev, "doorbell mapped BAR%d+0x%x\n", bar, rc->db_offset);
 
 	/* HDMA regs live in the same BAR0 target0 window at 0x4000 */
-	if (pci_resource_len(pdev, bar) > INFER_HDMA_BASE) {
-		rc->hdma_iomem = base + INFER_HDMA_BASE;
-		rc->hdma_len = pci_resource_len(pdev, bar) - INFER_HDMA_BASE;
+	if (pci_resource_len(pdev, bar) > BST_TRGT0_HDMA_BASE) {
+		rc->hdma_iomem = base + BST_TRGT0_HDMA_BASE;
+		rc->hdma_len = pci_resource_len(pdev, bar) - BST_TRGT0_HDMA_BASE;
 		dev_info(&pdev->dev, "HDMA regs mapped BAR%d+0x%x len=0x%zx\n",
-			 bar, INFER_HDMA_BASE, rc->hdma_len);
+			 bar, BST_TRGT0_HDMA_BASE, rc->hdma_len);
 	}
 	return 0;
 }

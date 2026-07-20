@@ -12,9 +12,9 @@ KDIR_ABS := $(abspath $(KDIR))
 
 ccflags-y += -I$(src)
 
-.PHONY: all modules clean inferlat inferpush inferzc inferdmastat inferhdma test_pcie_comm_ep2 check-version
+.PHONY: all modules clean inferlat inferpush inferzc inferdmastat test_pcie_comm_ep2 check-version
 
-all: check-version modules inferlat inferpush inferzc inferdmastat inferhdma test_pcie_comm_ep2
+all: check-version modules inferlat inferpush inferzc inferdmastat test_pcie_comm_ep2
 
 check-version:
 	@rel=$$(make -s -C $(KDIR_ABS) ARCH=$(ARCH) kernelrelease); \
@@ -42,9 +42,6 @@ test_pcie_comm_ep2: test_pcie_comm_ep2.c infer_proto.h infer_proto_v2.h
 inferdmastat: inferdmastat.c infer_proto.h infer_proto_v2.h
 	$(CROSS_COMPILE)gcc -O2 -Wall -o inferdmastat inferdmastat.c
 
-inferhdma: inferhdma.c infer_proto.h infer_proto_v2.h
-	$(CROSS_COMPILE)gcc -O2 -Wall -o inferhdma inferhdma.c
-
 clean:
 	$(MAKE) -C $(KDIR_ABS) M=$(CURDIR) clean 2>/dev/null || true
-	rm -f inferlat inferpush inferzc inferdmastat inferhdma test_pcie_comm_ep2
+	rm -f inferlat inferpush inferzc inferdmastat test_pcie_comm_ep2
